@@ -1,0 +1,17 @@
+{
+  "name": "serviceflow-cloud",
+  "version": "1.0.0",
+  "description": "Sunshine Laundry Group 維修報單系統 — Zeabur + PostgreSQL cloud sync",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "pg": "^8.12.0",
+    "nodemailer": "^6.9.14"
+  }
+}
