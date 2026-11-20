@@ -603,6 +603,7 @@
                 <button type="button" class="btn btn-secondary" id="shopDDBtn" aria-haspopup="true" aria-expanded="false">⇅ 批量導入 Import ▾</button>
                 <div class="imp-menu" id="shopDDMenu" role="menu">
                   <button type="button" class="imp-item" id="dlShopTplBtn" role="menuitem">⬇ 下載店鋪範本 Download Shop Template</button>
+                  <button type="button" class="imp-item" id="expShopBtn" role="menuitem">⬇ 導出現有店鋪（含密碼）Export Shops</button>
                   <button type="button" class="imp-item" id="impShopBtn" role="menuitem">⬆ 上傳 Excel 導入店鋪 Upload &amp; Import Shops</button>
                 </div>
               </div>
@@ -3387,7 +3388,7 @@ let uidSeq = 100, cidSeq = 100;
 
 /* ================= APP VERSION ================= */
 /* 系統版本號 App version — 顯示於首頁與登入頁頁尾 shown in front/login page footer */
-const APP_VERSION = 'v1.9.5';
+const APP_VERSION = 'v1.9.6';
 const APP_BUILD = '2026-11-10';
 function applyAppVersion(){
   try{
@@ -3672,6 +3673,23 @@ function orderServiceAddress(o){
 }
 // 公司門鎖密碼 Company door lock code
 function companyDoorCode(id){ const c=store.companies.find(x=>x.id===id); return c && c.doorCode ? String(c.doorCode).trim() : ''; }
+// 工單所屬門店 Branch of an order (IT asset → owner brand's branch; machine → machine's branch)
+function orderBranch(o){
+  if(!o) return null;
+  var cid=o.companyId, bid=o.branchId||'';
+  if(o.itAssetId){ cid=o.itOwnerCompanyId||o.companyId; }
+  else if(o.machineId){ var m=store.machines.find(function(x){return x.id===o.machineId;}); if(m){ cid=m.companyId||cid; bid=m.branchId||bid; } }
+  if(!bid) return null;
+  var c=store.companies.find(function(x){return x.id===cid;});
+  return (c&&Array.isArray(c.branches))?(c.branches.find(function(x){return x.id===bid;})||null):null;
+}
+// 工單門鎖密碼:門店密碼優先,冇就用公司密碼 Order door code: branch first, then company
+function orderDoorCode(o){
+  if(!o) return '';
+  var b=orderBranch(o);
+  if(b && b.doorCode && String(b.doorCode).trim()) return String(b.doorCode).trim();
+  return companyDoorCode(o.itAssetId?(o.itOwnerCompanyId||o.companyId):o.companyId);
+}
 // 門鎖密碼遮蔽顯示(點擊先睇)Masked door code, click to reveal
 function doorCodeHtml(code){
   if(!code) return '';
@@ -4416,7 +4434,7 @@ function renderTechQuick(o){
     +(o.manualNo?('<div><div class="k">手寫單號 Manual Ticket</div><div class="v"><b>'+esc(o.manualNo)+'</b></div></div>'):'')
     +'<div class="full"><div class="k">問題描述 Issue</div><div class="v">'+esc(o.issue||'—')+(o.notes?('<br><span class="tq-sub">'+esc(o.notes)+'</span>'):'')+'</div></div>'
     +'<div class="full"><div class="k">服務地址 Service Address</div><div class="v">'+(orderServiceAddress(o)?esc(orderServiceAddress(o)):'<span class="tq-sub">未設定 Not set</span>')+'</div></div>'
-    +doorCodeHtml(companyDoorCode(o.companyId))
+    +doorCodeHtml(orderDoorCode(o))
     +'</div>'
     +(orderServiceAddress(o)&&navUrl(orderServiceAddress(o))?('<div class="btn-row" style="margin:.2rem 0 .6rem"><a class="btn btn-primary" style="flex:1;display:inline-flex;align-items:center;justify-content:center;gap:.35rem" target="_blank" rel="noopener" href="'+navUrl(orderServiceAddress(o))+'">📍 開啟 Google 導航 Open Google Maps Navigation</a></div>'):'')
     +'<div class="tq-sect">手寫單號碼 Manual Ticket No. <span class="tq-sub" style="font-weight:400">（選填，可後補 Optional）</span></div>'
@@ -6860,7 +6878,7 @@ function openOrderModal(no){
       <div><div class="k">聯絡人 Contact</div><div class="v">${esc(o.contact)}</div></div>
       <div><div class="k">聯絡方式 Via</div><div class="v">${esc(o.via)} · ${esc(o.value)}</div></div>
       <div class="full"><div class="k">服務地址 Service Address</div><div class="v">${orderServiceAddress(o)?esc(orderServiceAddress(o))+(navUrl(orderServiceAddress(o))?' <a class="btn btn-secondary btn-sm" style="margin-left:.5rem;display:inline-flex;align-items:center;gap:.3rem;vertical-align:middle" target="_blank" rel="noopener" href="'+navUrl(orderServiceAddress(o))+'">📍 開啟 Google 導航 Navigate</a>':''):'<span class="small">未設定 Not set</span>'}</div></div>
-      ${doorCodeHtml(companyDoorCode(o.companyId))}
+      ${doorCodeHtml(orderDoorCode(o))}
       <div class="full"><div class="k">建立時間 Created</div><div class="v">${esc(o.created)}</div></div>
     </div>
     ${can('orders')?`<div class="field"><label>更新狀態 Update Status</label><select id="m_status">${Object.keys(ORDER_STATUS).map(k=>`<option value="${k}" ${o.status===k?'selected':''}>${ORDER_STATUS[k]}</option>`).join('')}</select></div>
@@ -6964,9 +6982,10 @@ function openBranchManager(companyId){
   const rows=c.branches.map(b=>`<tr>
       <td><b>${esc(b.name_zh||'')}</b> ${esc(b.name_en||'')}</td>
       <td>${esc(b.address||'')||'<span class="small">—</span>'}</td>
+      <td>${(b.doorCode&&String(b.doorCode).trim())?'<span class="chip success">🔑 已設定 Set</span>':(c.doorCode?'<span class="chip muted">跟公司 Company</span>':'<span class="small">—</span>')}</td>
       <td>${machinesInBranch(companyId,b.id)}</td>
       <td onclick="event.stopPropagation()">${canEdit?`<div class="btn-row" style="gap:.35rem"><button class="btn btn-secondary btn-sm" data-editbranch="${b.id}">修改 Edit</button><button class="btn btn-danger btn-sm" data-delbranch="${b.id}">刪除 Delete</button></div>`:'<span class="small">—</span>'}</td>
-    </tr>`).join('') || '<tr><td colspan="4" class="small">暫無門店，請按「新增門店」。No branches yet.</td></tr>';
+    </tr>`).join('') || '<tr><td colspan="5" class="small">暫無門店，請按「新增門店」。No branches yet.</td></tr>';
   const totalM = store.machines.filter(m=>m.companyId===companyId).length;
   openModal('門店管理 Branch Manager · '+esc(c.name_en)+' '+esc(c.name_zh), `
     <div class="detail-grid" style="margin-bottom:.8rem">
@@ -6981,7 +7000,7 @@ function openBranchManager(companyId){
     </div>
     <p class="small" style="margin:.1rem 0 .8rem">同一品牌（公司）可旗下多間門店；聯絡人、電話、Email 已在公司層設定，門店只需填名稱與地址。One brand can have many branches; contact info is set at company level, so a branch only needs a name and address.</p>
     ${canEdit?`<div class="btn-row" style="margin-bottom:.7rem"><button class="btn btn-primary btn-sm" id="bm_add">+ 新增門店 Add Branch</button></div>`:''}
-    <div class="table-wrap"><table><thead><tr><th>門店名稱 Branch</th><th>地址 Address</th><th>綁定設備 Machines</th><th>操作 Action</th></tr></thead><tbody id="bm_tbody">${rows}</tbody></table></div>
+    <div class="table-wrap"><table><thead><tr><th>門店名稱 Branch</th><th>地址 Address</th><th>門鎖密碼 Door Code</th><th>綁定設備 Machines</th><th>操作 Action</th></tr></thead><tbody id="bm_tbody">${rows}</tbody></table></div>
   `, true);
   const addBtn=$('#bm_add'); if(addBtn) addBtn.addEventListener('click',()=>openBranchForm(companyId,null));
   $$('[data-editbranch]').forEach(btn=>btn.addEventListener('click',e=>{ e.stopPropagation(); openBranchForm(companyId, btn.dataset.editbranch); }));
@@ -6993,20 +7012,22 @@ function openBranchForm(companyId, branchId){
   const b = branchId? c.branches.find(x=>x.id===branchId) : null;
   const isEdit=!!b;
   openModal((isEdit?'修改門店 Edit Branch':'新增門店 Add Branch')+' · '+esc(c.name_en)+' '+esc(c.name_zh), `
-    <p class="small" style="margin:.1rem 0 .8rem">聯絡人／電話／Email 已在公司（品牌）層設定，門店只需填門店名稱與地址。Contact info is inherited from the company; only branch name and address are needed here.</p>
+    <p class="small" style="margin:.1rem 0 .8rem">聯絡人／電話／Email 已在公司（品牌）層設定，門店只需填門店名稱、地址及門鎖密碼（每間門店可不同）。Contact info is inherited from the company; fill in the branch name, address and door lock code (can differ per branch).</p>
     <div class="field-grid">
       <div class="field full"><label>門店名稱（中）Branch Name (ZH)</label><input id="bf_zh" value="${isEdit?esc(b.name_zh||''):''}" placeholder="大角咀門店"></div>
       <div class="field full"><label>門店名稱（英）Branch Name (EN)</label><input id="bf_en" value="${isEdit?esc(b.name_en||''):''}" placeholder="Tai Kok Tsui Store"></div>
       <div class="field full"><label>門店地址 Branch Address</label><textarea id="bf_addr">${isEdit?esc(b.address||''):''}</textarea></div>
+      <div class="field full"><label>🔑 門鎖密碼 Door Lock Code</label><input id="bf_door" type="password" autocomplete="new-password" value="${isEdit?esc(b.doorCode||''):''}" placeholder="例如 1234#（留空 = 用公司密碼 Blank = use company code）"><label class="small" style="display:flex;gap:.35rem;align-items:center;margin-top:.3rem;font-weight:400"><input type="checkbox" id="bf_door_show" style="width:auto"> 顯示密碼 Show code</label></div>
     </div>
     <div class="btn-row"><button class="btn btn-primary" id="bf_save">${isEdit?'儲存 Save':'新增門店 Add Branch'}</button><button class="btn btn-secondary" id="bf_cancel">取消 Cancel</button></div>`);
   $('#bf_cancel').addEventListener('click',()=>openBranchManager(companyId));
+  const _bds=$('#bf_door_show'); if(_bds) _bds.addEventListener('change',()=>{ const i=$('#bf_door'); if(i) i.type=_bds.checked?'text':'password'; });
   $('#bf_save').addEventListener('click',()=>{
     const zh=$('#bf_zh').value.trim(), en=$('#bf_en').value.trim();
     if(!zh && !en){ toast('請輸入門店名稱 Enter branch name'); return; }
-    const nv={ name_zh:zh, name_en:en, address:$('#bf_addr').value.trim() };
+    const nv={ name_zh:zh, name_en:en, address:$('#bf_addr').value.trim(), doorCode:($('#bf_door')?$('#bf_door').value.trim():'') };
     if(isEdit){
-      const map={name_zh:'名稱ZH', name_en:'名稱EN', address:'地址 Address'};
+      const map={name_zh:'名稱ZH', name_en:'名稱EN', address:'地址 Address', doorCode:'門鎖密碼 Door Code'};
       const changes=diffFields(b,nv,map); Object.assign(b,nv);
       addLog('edit_company', c.name_en+' · 門店 '+(b.name_zh||b.name_en), changes.length?changes.map(ch=>ch.label).join('、'):'無變動');
       toast('門店已修改 Branch updated');
@@ -7350,17 +7371,54 @@ var SHOP_COLS = [
   {k:'code',   zh:'公司代碼/品牌 Company Code*',    kw:['公司代碼','公司代号','品牌','company code','company','code']},
   {k:'name_zh',zh:'店鋪名稱(中) Shop Name ZH',      kw:['名稱(中)','名稱（中）','中文名','name zh','name (zh)','zh','中']},
   {k:'name_en',zh:'店鋪名稱(英) Shop Name EN',      kw:['名稱(英)','名稱（英）','英文名','name en','name (en)','en','英']},
-  {k:'address',zh:'店鋪地址 Shop Address',           kw:['地址','address','addr']}
+  {k:'address',zh:'店鋪地址 Shop Address',           kw:['地址','address','addr']},
+  {k:'doorCode',zh:'門鎖密碼 Door Lock Code',        kw:['門鎖密碼','門鎖','door lock code','door code','door lock','door']}
 ];
+// 門鎖密碼欄設為文字格式,避免 0 開頭被 Excel 刪走。Door-code column as text so leading zeros are kept.
+function _downloadShopBook(filename, rows){
+  var X=_XLSX(); var wb=X.utils.book_new();
+  var ws=X.utils.aoa_to_sheet(rows);
+  var col=SHOP_COLS.length-1; var last=Math.max(rows.length+300, 300);
+  for(var r=1;r<last;r++){
+    var ref=X.utils.encode_cell({r:r,c:col});
+    var v=(rows[r]&&rows[r][col]!=null)?String(rows[r][col]):'';
+    ws[ref]={t:'s', v:v, z:'@'};
+  }
+  ws['!ref']=X.utils.encode_range({s:{r:0,c:0},e:{r:last-1,c:col}});
+  ws['!cols']=rows[0].map(function(x){return {wch:Math.max(18,String(x).length+2)};});
+  X.utils.book_append_sheet(wb, ws, '店鋪 Shops');
+  var ws2=X.utils.aoa_to_sheet(_companyRefRows()); ws2['!cols']=[{wch:22},{wch:26},{wch:26}];
+  X.utils.book_append_sheet(wb, ws2, '公司對照 Companies');
+  var ws3=X.utils.aoa_to_sheet([
+    ['說明 Notes'],
+    ['1. 以「公司代碼 + 店鋪名稱」比對：名稱相同 = 更新該門店；名稱不同 = 新增門店。Same company code + shop name = update; otherwise a new shop is added.'],
+    ['2. 門鎖密碼留空 = 不改動現有密碼；填「-」= 清除門店密碼（改用公司密碼）。Blank door code = keep current; "-" = clear (fall back to company code).'],
+    ['3. 地址留空 = 不改動現有地址。Blank address = keep current address.'],
+    ['4. 此檔案含門鎖密碼，請妥善保管。This file contains door codes — keep it safe.']
+  ]); ws3['!cols']=[{wch:110}];
+  X.utils.book_append_sheet(wb, ws3, '說明 Notes');
+  X.writeFile(wb, filename);
+}
+function exportShops(){
+  if(!_xlsxReady()){ toast('Excel 元件未載入 xlsx not loaded'); return; }
+  if(!_impCanEdit('companies')) return;
+  var rows=[SHOP_COLS.map(function(c){return c.zh;})]; var n=0;
+  store.companies.forEach(function(c){
+    (Array.isArray(c.branches)?c.branches:[]).forEach(function(b){
+      rows.push([c.code||c.name_en||c.name_zh||'', b.name_zh||'', b.name_en||'', b.address||'', b.doorCode||'']); n++;
+    });
+  });
+  var d=new Date(); var ds=d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+  _downloadShopBook('現有店鋪_Shops_'+ds+'.xlsx', rows);
+  addLog('edit_company','導出店鋪 Export shops', n+' 間店鋪');
+  toast('已導出 '+n+' 間店鋪 Exported '+n+' shops');
+}
 function downloadShopTemplate(){
   if(!_xlsxReady()){ toast('Excel 元件未載入 xlsx not loaded'); return; }
   var header=SHOP_COLS.map(function(c){return c.zh;});
   var c1=store.companies[0]; var code1=(c1&&c1.code)||'HDL';
-  var sample=[code1,'大角咀門店','Tai Kok Tsui Store','大角咀中匯街29號地下'];
-  _downloadWorkbook('店鋪導入範本_Shop_Import_Template.xlsx', [
-    {name:'店鋪 Shops', rows:[header, sample], widths:header.map(function(x){return Math.max(16,x.length+2);})},
-    {name:'公司對照 Companies', rows:_companyRefRows(), widths:[22,26,26]}
-  ]);
+  var sample=[code1,'大角咀門店','Tai Kok Tsui Store','大角咀中匯街29號地下','1234#'];
+  _downloadShopBook('店鋪導入範本_Shop_Import_Template.xlsx', [header, sample]);
   toast('已下載店鋪範本 Template downloaded');
 }
 
@@ -7480,7 +7538,7 @@ function importShopsFromRows(aoa){
   for(var r=1;r<aoa.length;r++){
     var row=aoa[r]; if(!row || row.join('').trim()==='') continue;
     var code=_cell(row, idx.code);
-    var zh=_cell(row, idx.name_zh), en=_cell(row, idx.name_en), addr=_cell(row, idx.address);
+    var zh=_cell(row, idx.name_zh), en=_cell(row, idx.name_en), addr=_cell(row, idx.address), door=_cell(row, idx.doorCode);
     if(!zh && !en){ errors.push('第 '+(r+1)+' 列:缺少店鋪名稱 Row '+(r+1)+': missing shop name'); continue; }
     var c=_findCompanyByCode(code);
     if(!c){ errors.push('第 '+(r+1)+' 列:找不到公司代碼「'+code+'」Row '+(r+1)+': company code not found'); continue; }
@@ -7490,9 +7548,9 @@ function importShopsFromRows(aoa){
       return (zh && String(b.name_zh||'').toLowerCase()===zh.toLowerCase())
           || (en && String(b.name_en||'').toLowerCase()===en.toLowerCase());
     });
-    if(ex){ ex.name_zh=zh||ex.name_zh; ex.name_en=en||ex.name_en; ex.address=addr||ex.address; updated++; }
+    if(ex){ ex.name_zh=zh||ex.name_zh; ex.name_en=en||ex.name_en; ex.address=addr||ex.address; if(door==='-') ex.doorCode=''; else if(door) ex.doorCode=door; updated++; }
     else {
-      c.branches.push({ id:'b'+Date.now().toString(36)+Math.floor(Math.random()*10000), name_zh:zh, name_en:en, address:addr });
+      c.branches.push({ id:'b'+Date.now().toString(36)+Math.floor(Math.random()*10000), name_zh:zh, name_en:en, address:addr, doorCode:(door==='-'?'':door) });
       added++;
     }
   }
@@ -7523,6 +7581,7 @@ function _wireImportButtons(){
   var m2=document.getElementById('impMachineBtn');   if(m2) m2.addEventListener('click', function(){ if(!_impCanEdit('machines')) return; if(!_xlsxReady()){toast('Excel 元件未載入');return;} document.getElementById('impMachineFile').click(); });
   var m3=document.getElementById('impMachineFile');   if(m3) m3.addEventListener('change', function(e){ var f=e.target.files&&e.target.files[0]; if(!f) return; _readSheetToRows(f, function(err,aoa){ e.target.value=''; if(err){ toast('讀取失敗 '+err.message); return; } importMachinesFromRows(aoa); }); });
   var s1=document.getElementById('dlShopTplBtn');     if(s1) s1.addEventListener('click', function(){ downloadShopTemplate(); });
+  var s0=document.getElementById('expShopBtn');       if(s0) s0.addEventListener('click', function(){ exportShops(); });
   var s2=document.getElementById('impShopBtn');        if(s2) s2.addEventListener('click', function(){ if(!_impCanEdit('companies')) return; if(!_xlsxReady()){toast('Excel 元件未載入');return;} document.getElementById('impShopFile').click(); });
   var s3=document.getElementById('impShopFile');       if(s3) s3.addEventListener('change', function(e){ var f=e.target.files&&e.target.files[0]; if(!f) return; _readSheetToRows(f, function(err,aoa){ e.target.value=''; if(err){ toast('讀取失敗 '+err.message); return; } importShopsFromRows(aoa); }); });
   // IT 資產批量導入 IT-asset bulk import
@@ -7901,7 +7960,7 @@ function buildN8nPayload(order){
     // 外客/手填地址優先用工單自帶地址;否則用公司地址。External/manual address takes priority; else company address.
     service_address:orderServiceAddress(order),
     nav_url:(orderServiceAddress(order)?navUrl(orderServiceAddress(order)):''),
-    door_code:(order.itAssetId?((store.companies.find(function(x){return x.id===(order.itOwnerCompanyId||order.companyId);})||{}).doorCode||''):(c?(c.doorCode||''):'')),
+    door_code:orderDoorCode(order),
     tg_group_id:(c?(c.tgGroupId||''):''),
     // Telegram 雙發送:主群組(管理所有公司)+ 該公司專屬群組。Dual send: master group (all companies) + this company's own group.
     tg_master_chat_id:(config.n8nTgMasterChat||''),
@@ -8001,7 +8060,7 @@ function buildOrderText(order){
   if(_kind==='external'){ _contactDisp=(order.extName||order.contact||'-')+' ('+(order.extPhone||order.value||'')+')'; }
   else { _contactDisp=(order.contact||'-')+' ('+(order.via||'')+' '+(order.value||'')+')'; }
   var _doorCo=(order.itAssetId?(store.companies.find(function(x){return x.id===(order.itOwnerCompanyId||order.companyId);})||c):c);
-  var _door=(_doorCo&&_doorCo.doorCode?String(_doorCo.doorCode).trim():'');
+  var _door=orderDoorCode(order);
   var vals={
     brand:bn,
     no:order.no||'-',
@@ -8555,7 +8614,7 @@ function openTechDetails(orderNo){
       <div><div class="k">建立時間 Created</div><div class="v">${esc(o.created||'—')}</div></div>
       <div><div class="k">負責師父 Technician</div><div class="v">${esc(o.assignedTech||'—')}</div></div>
       <div class="full"><div class="k">服務地址 Service Address</div><div class="v">${orderServiceAddress(o)?esc(orderServiceAddress(o))+(navUrl(orderServiceAddress(o))?' <a class="btn btn-secondary btn-sm" style="margin-left:.5rem;display:inline-flex;align-items:center;gap:.3rem;vertical-align:middle" target="_blank" rel="noopener" href="'+navUrl(orderServiceAddress(o))+'">📍 開啟 Google 導航 Navigate</a>':''):'<span class="small">未設定 Not set</span>'}</div></div>
-      ${doorCodeHtml(companyDoorCode(o.companyId))}
+      ${doorCodeHtml(orderDoorCode(o))}
     </div>
     <p class="sect-title" style="margin:.4rem 0">本次更換零件 Parts Used</p>
     <div class="v" style="margin-bottom:.6rem">${orderPartsText(o)||'<span class="small">尚未記錄零件 No parts recorded</span>'}${o.irreparable?'<br><span class="chip error">⚠ 此機無法維修,需更換整台設備 Whole-unit replacement</span>':''}</div>
