@@ -3387,7 +3387,7 @@ let uidSeq = 100, cidSeq = 100;
 
 /* ================= APP VERSION ================= */
 /* 系統版本號 App version — 顯示於首頁與登入頁頁尾 shown in front/login page footer */
-const APP_VERSION = 'v1.9.3';
+const APP_VERSION = 'v1.9.5';
 const APP_BUILD = '2026-11-10';
 function applyAppVersion(){
   try{
@@ -3654,7 +3654,22 @@ const companyNameSort = id => { const c = store.companies.find(x=>x.id===id); re
 const companyAddress = id => { const c = store.companies.find(x=>x.id===id); return c && c.address ? String(c.address).trim() : ''; };
 function navUrl(addr){ addr=(addr||'').trim(); if(!addr) return ''; return 'https://www.google.com/maps/dir/?api=1&destination='+encodeURIComponent(addr); }
 // 工單服務地址:外客/手填地址優先,否則公司地址。Order service address: external/manual first, else company address.
-function orderServiceAddress(o){ if(o && o.extAddress && String(o.extAddress).trim()) return String(o.extAddress).trim(); return companyAddress(o?o.companyId:''); }
+// 工單服務地址優先次序:外客/手填 > IT 安裝地址 > 電腦設備所屬門店 > 機器所屬門店地址 > 公司地址。
+// Service address priority: external/manual > IT install address > IT asset branch > machine's branch address > company address.
+function machineBranchAddress(m){
+  if(!m || !m.branchId) return '';
+  var c=store.companies.find(function(x){return x.id===m.companyId;});
+  var b=(c&&Array.isArray(c.branches))?c.branches.find(function(x){return x.id===m.branchId;}):null;
+  return (b&&b.address)?String(b.address).trim():'';
+}
+function orderServiceAddress(o){
+  if(!o) return '';
+  if(o.extAddress && String(o.extAddress).trim()) return String(o.extAddress).trim();
+  if(o.installIT && o.installIT.address && String(o.installIT.address).trim()) return String(o.installIT.address).trim();
+  if(o.itAssetId){ var ia=_itOrderAddr(o); if(ia) return String(ia).trim(); }
+  if(o.machineId){ var m=store.machines.find(function(x){return x.id===o.machineId;}); var ba=machineBranchAddress(m); if(ba) return ba; }
+  return companyAddress(o.companyId);
+}
 // 公司門鎖密碼 Company door lock code
 function companyDoorCode(id){ const c=store.companies.find(x=>x.id===id); return c && c.doorCode ? String(c.doorCode).trim() : ''; }
 // 門鎖密碼遮蔽顯示(點擊先睇)Masked door code, click to reveal
@@ -4143,7 +4158,7 @@ function selectMachineForOrder(m, viaQR){
     <div class="mini"><div class="k">機器名稱 Machine Name</div><div class="v">${esc(m.name)}</div></div>
     <div class="mini"><div class="k">機器類型 Machine Type</div><div class="v">${esc(m.type)}</div></div>
     <div class="mini"><div class="k">公司名稱 Company</div><div class="v">${esc(c?c.name_en+' '+c.name_zh:'—')}</div></div>
-    <div class="mini" style="grid-column:1/-1"><div class="k">服務地址 Address</div><div class="v">${esc(c?c.address:'—')}</div></div>
+    <div class="mini" style="grid-column:1/-1"><div class="k">服務地址 Address</div><div class="v">${esc(machineBranchAddress(m)||(c?c.address:'')||'—')}</div></div>
     <div class="mini"><div class="k">購買日期 Purchase Date</div><div class="v">${esc(m.purchase)}</div></div>
     <div class="mini"><div class="k">保養到期 Warranty To</div><div class="v">${esc(m.warranty)}</div></div>
     <div class="mini"><div class="k">檢查週期 Inspection Cycle</div><div class="v">${m.inspectCycle?esc(m.inspectCycle)+' 個月 mo':'— 未啟用 Off'}</div></div>
@@ -4528,7 +4543,9 @@ $('#submitOrderBtn').addEventListener('click', () => {
   const notes='';
   const order={no, kind:'repair', companyId:verifiedMachine.companyId, machineId:verifiedMachine.id, issue, notes, urgency, bookingDate:bd, slot, installDate:idt, manualNo:mno, status:'new', contact:cp, via, value:cv, created:nowStr(), _ts:Date.now()};
   // 電腦設備報修:記錄 IT 資產並交由 IT 維修負責公司處理 IT-equipment repair: link asset, routed to IT handler
-  if(verifiedMachine._itAsset){ order.itAssetId=verifiedMachine._itAsset; if(verifiedMachine.branchId) order.branchId=verifiedMachine.branchId; const _mg=itManagerCompany(); if(_mg) order.itHandlerId=_mg.id; }
+  // 工單直接歸入 IT 維修負責公司(companyId=AppSuccess),原品牌記於 itOwnerCompanyId,品牌不會收到通知。
+  // The order itself belongs to the IT handler (companyId = AppSuccess); the brand is kept in itOwnerCompanyId and is NOT notified.
+  if(verifiedMachine._itAsset){ order.itAssetId=verifiedMachine._itAsset; order.itOwnerCompanyId=verifiedMachine.companyId; if(verifiedMachine.branchId) order.branchId=verifiedMachine.branchId; const _mg=itManagerCompany(); if(_mg){ order.itHandlerId=_mg.id; order.companyId=_mg.id; } }
   store.orders.unshift(order);
   addLog('new_order', no, `公司 ${companyName(order.companyId)} / 機器 ${order.machineId} / ${urgency==='urgent'?'緊急':'非緊急'}`);
   pushNotification('new_order','technician',no,'新維修工單 New order · '+no+'（'+companyName(order.companyId)+' / '+order.machineId+'）'+(urgency==='urgent'?' · 緊急 URGENT':''));
@@ -5872,7 +5889,7 @@ function itManagerCompany(){
 function _isItRepair(o){ return !!(o && o.itAssetId && (o.kind||'repair')==='repair'); }
 // IT 維修工單的通知公司清單 companies to notify for an IT-equipment repair
 function _itRepairNotifyCompanies(o){
-  var out=[]; var mgr=itManagerCompany(); var own=store.companies.find(function(x){return x.id===o.companyId;});
+  var out=[]; var mgr=(o.itHandlerId?store.companies.find(function(x){return x.id===o.itHandlerId;}):null)||itManagerCompany(); var own=store.companies.find(function(x){return x.id===(o.itOwnerCompanyId||o.companyId);});
   if(mgr) out.push({co:mgr, role:'it_manager'});
   if((config.itNotifyOwner===true || !mgr) && own && (!mgr || own.id!==mgr.id)) out.push({co:own, role:'company'});
   return out;
@@ -7882,9 +7899,9 @@ function buildN8nPayload(order){
     company:{ id:order.companyId, name_en:c?c.name_en:'', name_zh:c?c.name_zh:'', phone:c?c.phone:'', whatsapp:c?c.whatsapp:'', email:c?c.email:'', address:c?c.address:'', ctype:(c?(c.ctype||'normal'):''), door_code:(c?(c.doorCode||''):''), tg_group_id:(c?(c.tgGroupId||''):''), wa_group_id:(c?(c.waGroupId||''):'') },
     order_kind:(order.kind||'repair'),
     // 外客/手填地址優先用工單自帶地址;否則用公司地址。External/manual address takes priority; else company address.
-    service_address:(order.extAddress||(c&&c.address?c.address:'')),
-    nav_url:(order.extAddress?navUrl(order.extAddress):(c&&c.address?navUrl(c.address):'')),
-    door_code:(c?(c.doorCode||''):''),
+    service_address:orderServiceAddress(order),
+    nav_url:(orderServiceAddress(order)?navUrl(orderServiceAddress(order)):''),
+    door_code:(order.itAssetId?((store.companies.find(function(x){return x.id===(order.itOwnerCompanyId||order.companyId);})||{}).doorCode||''):(c?(c.doorCode||''):'')),
     tg_group_id:(c?(c.tgGroupId||''):''),
     // Telegram 雙發送:主群組(管理所有公司)+ 該公司專屬群組。Dual send: master group (all companies) + this company's own group.
     tg_master_chat_id:(config.n8nTgMasterChat||''),
@@ -7912,7 +7929,7 @@ function buildN8nPayload(order){
     external:(order.kind==='external'?{ name:order.extName||order.contact||'', phone:order.extPhone||order.value||'', address:order.extAddress||'', reason:order.extReason||order.issue||'' }:null),
     install:(order.kind==='install'?{ qty_wash:order.installQtyWash||0, qty_dry:order.installQtyDry||0, wh_machine_ids:order.whMachineIds||[], notify_company_ids:order.installNotifyCompanies||[], it:(order.installIT||null) }:null),
     machine:{ id:order.machineId, name:m?m.name:'', brand:m?m.brand:'', model:m?m.model:'', location:m?m.location:'' },
-    it_asset:(function(){ if(!order.itAssetId) return null; var a=(store.itAssets||[]).find(function(x){return x.id===order.itAssetId;}); if(!a) return {id:order.itAssetId}; var w=itAssetWhere(a); var mg=itManagerCompany(); return { id:a.id, name:a.name||'', type:itAssetTypeLabel(a.type), sn:a.sn||'', brand:a.brand||'', model:a.model||'', spec:a.spec||'', location:a.location||'', ip:a.ip||'', branch:w.branch||'', handler_company_id:(mg?mg.id:''), handler_company:(mg?((mg.name_zh||'')+' '+(mg.name_en||'')).trim():'') }; })(),
+    it_asset:(function(){ if(!order.itAssetId) return null; var a=(store.itAssets||[]).find(function(x){return x.id===order.itAssetId;}); if(!a) return {id:order.itAssetId}; var w=itAssetWhere(a); var mg=itManagerCompany(); return { id:a.id, name:a.name||'', type:itAssetTypeLabel(a.type), sn:a.sn||'', brand:a.brand||'', model:a.model||'', spec:a.spec||'', location:a.location||'', ip:a.ip||'', branch:w.branch||'', handler_company_id:(mg?mg.id:''), handler_company:(mg?((mg.name_zh||'')+' '+(mg.name_en||'')).trim():''), owner_company_id:(order.itOwnerCompanyId||a.companyId||''), owner_company:w.company||'' }; })(),
     contact:{ person:order.contact, via:order.via, value:order.value },
     text:buildOrderText(order),
   };
@@ -7949,12 +7966,14 @@ function _itNotifyBlock(it){
   if(it.address) L.push('安裝地址 Install Addr  ：'+it.address);
   return L.join('\n')+'\n';
 }
+// IT 維修工單服務地址:原品牌門店地址 > 品牌地址 IT repair address: owner branch > owner company
+function _itOrderAddr(o){ var oc=store.companies.find(function(x){return x.id===(o.itOwnerCompanyId||o.companyId);}); var b=(o.branchId&&oc&&Array.isArray(oc.branches))?oc.branches.find(function(x){return x.id===o.branchId;}):null; return (b&&b.address)?b.address:((oc&&oc.address)?oc.address:''); }
 // 電腦設備顯示文字 IT asset display line
 function _itAssetDisp(o){
   var a=(store.itAssets||[]).find(function(x){return x.id===o.itAssetId;});
   if(!a) return '💻 '+(o.machineId||'');
   var w=itAssetWhere(a);
-  return '💻 '+(a.name||'')+' · '+itAssetTypeLabel(a.type)+(a.sn?(' · SN '+a.sn):'')+((a.brand||a.model)?(' · '+((a.brand||'')+' '+(a.model||'')).trim()):'')+(w.branch?(' · 門店 '+w.branch):'');
+  return '💻 '+(a.name||'')+' · '+itAssetTypeLabel(a.type)+(w.company&&w.company!=='—'?(' · 品牌 Brand '+w.company):'')+(a.sn?(' · SN '+a.sn):'')+((a.brand||a.model)?(' · '+((a.brand||'')+' '+(a.model||'')).trim()):'')+(w.branch?(' · 門店 '+w.branch):'');
 }
 // 預設 TEXT 內文(與系統郵件一致 + 師父維修工單站連結)。Default TEXT (matches system email + repair-station link).
 function buildOrderText(order){
@@ -7965,8 +7984,8 @@ function buildOrderText(order){
   var _kindLabel=(_kind==='install'?'📦 新安裝 New Install':_kind==='external'?'👤 外客 External Customer':_kind==='inspection'?'🔎 例行檢查 Inspection':(order.itAssetId?'💻 電腦設備維修 IT Equipment Repair':'🔧 維修 Repair'));
   // 服務地址:外客/手填優先,否則公司地址。Service address: external/manual first, else company.
   var _itAddr=(order.installIT&&order.installIT.address?String(order.installIT.address).trim():'');
-  var _brAddr=''; if(order.itAssetId && order.branchId && c && Array.isArray(c.branches)){ var _ob=c.branches.find(function(b){return b.id===order.branchId;}); if(_ob&&_ob.address) _brAddr=String(_ob.address).trim(); }
-  var _addr=(_itAddr?_itAddr:(order.extAddress?String(order.extAddress).trim():(_brAddr?_brAddr:(c&&c.address?String(c.address).trim():'-'))));
+  var _brAddr=''; if(order.itAssetId){ var _oc=store.companies.find(function(x){return x.id===(order.itOwnerCompanyId||order.companyId);}); var _ob=(order.branchId&&_oc&&Array.isArray(_oc.branches))?_oc.branches.find(function(b){return b.id===order.branchId;}):null; if(_ob&&_ob.address) _brAddr=String(_ob.address).trim(); else if(_oc&&_oc.address) _brAddr=String(_oc.address).trim(); }
+  var _addr=(orderServiceAddress(order)||'-');
   var _machineDisp;
   if(_kind==='install'){
     if(order.installIT){ var _it=order.installIT; var _p=[]; if(_it.pos>0)_p.push('POS ×'+_it.pos); if(_it.pc>0)_p.push('電腦 PC ×'+_it.pc); if(_it.camAudio>0)_p.push('收音鏡頭 Audio Cam ×'+_it.camAudio); if(_it.camNormal>0)_p.push('普通鏡頭 Cam ×'+_it.camNormal); if(_it.recDays>0)_p.push('錄影 Rec '+_it.recDays+' 天days'); _machineDisp='💻 IT 安裝 IT Install · '+(_p.join(' / ')||'（未填 no items）'); }
@@ -7981,7 +8000,8 @@ function buildOrderText(order){
   var _contactDisp;
   if(_kind==='external'){ _contactDisp=(order.extName||order.contact||'-')+' ('+(order.extPhone||order.value||'')+')'; }
   else { _contactDisp=(order.contact||'-')+' ('+(order.via||'')+' '+(order.value||'')+')'; }
-  var _door=(c&&c.doorCode?String(c.doorCode).trim():'');
+  var _doorCo=(order.itAssetId?(store.companies.find(function(x){return x.id===(order.itOwnerCompanyId||order.companyId);})||c):c);
+  var _door=(_doorCo&&_doorCo.doorCode?String(_doorCo.doorCode).trim():'');
   var vals={
     brand:bn,
     no:order.no||'-',
@@ -7996,7 +8016,7 @@ function buildOrderText(order){
     link:orderStationUrl(order.no),
     status:(ORDER_STATUS[order.status]||order.status||'-'),
     address:_addr,
-    nav:(order.extAddress?navUrl(order.extAddress):(c&&c.address?navUrl(c.address):'')),
+    nav:(_addr&&_addr!=='-'?navUrl(_addr):''),
     door:_door
   };
   var def='🔔 【'+bn+'】新工單 New Service Order · '+vals.no+'\n\n'+
