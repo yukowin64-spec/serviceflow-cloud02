@@ -3388,7 +3388,7 @@ let uidSeq = 100, cidSeq = 100;
 
 /* ================= APP VERSION ================= */
 /* 系統版本號 App version — 顯示於首頁與登入頁頁尾 shown in front/login page footer */
-const APP_VERSION = 'v1.9.8';
+const APP_VERSION = 'v1.9.9';
 const APP_BUILD = '2026-11-10';
 function applyAppVersion(){
   try{
@@ -5318,20 +5318,22 @@ function renderDashboard(){
   const _vOrders = store.orders.filter(o=>canSeeCompany(o.companyId));
   const _vMachines = store.machines.filter(m=>canSeeCompany(m.companyId));
   const _vCompanies = scopedCompanies();
-  const openOrders = _vOrders.filter(o=>o.status!=='completed'&&o.status!=='cancelled').length;
   // 保養過期提示可開/關(config.dashShowWarranty,預設開)。關閉後只顯示維修超標。Warranty-expired alerts toggleable; off = over-limit only.
   const _showW = (config.dashShowWarranty!==false);
+  // 關閉「顯示保養過期」時,總覽唔計例行保養/檢查工單。When hidden, dashboard excludes routine maintenance (inspection) orders.
+  const _dOrders = _showW ? _vOrders : _vOrders.filter(o=>orderKind(o)!=='inspection');
+  const openOrders = _dOrders.filter(o=>o.status!=='completed'&&o.status!=='cancelled').length;
   const _isAlert = m=> overLimit(m) || (_showW && warrantyExpired(m));
   const _wChip = m=> (_showW && warrantyExpired(m)) ? '<span class="chip warning">保養過期 Expired</span>' : '';
   const alerts = _vMachines.filter(_isAlert).length;
   $('#dashStats').innerHTML = `
     <article class="card stat"><div class="label">公司 Companies</div><div class="value">${_vCompanies.length}</div><div class="hint">可獨立管理</div></article>
     <article class="card stat"><div class="label">設備 Machines</div><div class="value">${_vMachines.length}</div><div class="hint">按公司綁定</div></article>
-    <article class="card stat"><div class="label">待處理工單 Open Orders</div><div class="value">${openOrders}</div><div class="hint">未完成</div></article>
+    <article class="card stat"><div class="label">待處理工單 Open Orders</div><div class="value">${openOrders}</div><div class="hint">${_showW?'未完成 Unfinished':'未完成（不含例行保養）Excl. routine maintenance'}</div></article>
     <article class="card stat"><div class="label">提示 Alerts</div><div class="value">${alerts}</div><div class="hint">${_showW?'保養過期／維修超標':'維修超標 Over limit'}</div></article>`;
   const _dsw=$('#dashShowWarranty'); if(_dsw) _dsw.checked=_showW;
   const _dsub=$('#dashAlertsSub'); if(_dsub) _dsub.textContent=_showW?'保養過期或維修次數超標的設備。Warranty expired or over repair limit.':'只顯示維修次數超標的設備（保養過期提示已關閉）。Over repair limit only (warranty-expired alerts hidden).';
-  const _latest=_vOrders.slice(0,5);
+  const _latest=_dOrders.slice(0,5);
   $('#dashOrders tbody').innerHTML = _latest.map(o=>`<tr><td>${esc(o.no)}</td><td>${esc(companyName(o.companyId))}</td><td>${esc(o.machineId)}</td><td><span class="chip ${o.status==='completed'?'success':o.status==='new'?'warning':'info'}">${ORDER_STATUS[o.status]||o.status}</span></td></tr>`).join('') || '<tr><td colspan="4" class="small">暫無工單</td></tr>';
   const dOC=$('#dashOrdersCards'); if(dOC) dOC.innerHTML=_latest.map(o=>`<div class="mcard"><div class="mcard-head"><strong>${esc(o.no)}</strong><span class="chip ${o.status==='completed'?'success':o.status==='new'?'warning':'info'}">${ORDER_STATUS[o.status]||o.status}</span></div><div class="mrow"><span>公司 Company</span><b>${esc(companyName(o.companyId))}</b></div><div class="mrow"><span>機器 Machine</span><b>${esc(o.machineId)}</b></div></div>`).join('') || '<div class="small">暫無工單 No orders</div>';
   const _alertMachines=_vMachines.filter(_isAlert);
@@ -5348,7 +5350,7 @@ function renderDashboard(){
   setInterval(function(){ document.querySelectorAll('input.no-copy').forEach(function(el){ if(el.type!=='password') el.type='password'; }); }, 1500);
 })();
 // 保養過期提示開關 Warranty-expired alert toggle
-(function(){ var el=document.getElementById('dashShowWarranty'); if(!el) return; el.addEventListener('change', function(){ config.dashShowWarranty=!!el.checked; try{ saveConfig(); }catch(_){} try{ renderDashboard(); }catch(_){} try{ toast(el.checked?'已顯示保養過期提示 Warranty alerts shown':'已隱藏保養過期提示 Warranty alerts hidden'); }catch(_){} }); })();
+(function(){ var el=document.getElementById('dashShowWarranty'); if(!el) return; el.addEventListener('change', function(){ config.dashShowWarranty=!!el.checked; try{ saveConfig(); }catch(_){} try{ renderDashboard(); }catch(_){} try{ toast(el.checked?'已顯示保養過期提示及例行保養工單 Warranty alerts & routine orders shown':'已隱藏保養過期提示及例行保養工單 Warranty alerts & routine orders hidden'); }catch(_){} }); })();
 /* 工單類型:舊工單無 kind 欄視為維修。order kind: legacy orders without kind = repair */
 function orderKind(o){ const k=o&&o.kind; return (k==='inspection'||k==='install'||k==='external')?k:'repair'; }
 function orderKindChip(o){
