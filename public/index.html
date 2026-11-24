@@ -852,7 +852,7 @@
           </div>
           <div class="field"><label>維修工單站網址 Repair Station URL <span class="small" style="opacity:.7">（選填 Optional）</span></label>
             <input id="set_n8nStationUrl" placeholder="https://xxx.zeabur.app （留空＝自動用目前網址 leave blank = use current site）">
-            <div class="small" style="opacity:.75;margin-top:.3rem">師父維修工單站的網址。系統會在通知結尾自動附上「<code>此網址/?order=工單編號</code>」，師父點入即可登入並直接開啟該工單。The base URL of your repair station; the system appends <code>/?order=&lt;orderNo&gt;</code> so technicians can tap to open that order.</div>
+            <div class="small" style="opacity:.75;margin-top:.3rem">師父維修工單站的網址。系統會在通知標題下方自動附上「<code>此網址/?order=工單編號</code>」，師父點入即可登入並直接開啟該工單。The base URL of your repair station; the system appends <code>/?order=&lt;orderNo&gt;</code> so technicians can tap to open that order.</div>
           </div>
           <div class="field"><label>自訂通知內文 Custom Notification TEXT <span class="small" style="opacity:.7">（選填 Optional）</span></label>
             <textarea id="set_n8nTextTpl" rows="8" style="width:100%;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.92rem;line-height:1.55" placeholder="留空＝使用預設格式 Leave blank = use default format"></textarea>
@@ -3388,7 +3388,7 @@ let uidSeq = 100, cidSeq = 100;
 
 /* ================= APP VERSION ================= */
 /* 系統版本號 App version — 顯示於首頁與登入頁頁尾 shown in front/login page footer */
-const APP_VERSION = 'v1.9.7';
+const APP_VERSION = 'v1.9.8';
 const APP_BUILD = '2026-11-10';
 function applyAppVersion(){
   try{
@@ -5216,7 +5216,8 @@ function notifyNewOrderEmail(o){
     '— '+bn+' 自動報單系統 Auto Order System'
   ].filter(function(x){return x!=='';});
   const subject='【'+bn+'自動報單系統】新'+kindZh+' · '+o.no+' · '+coName;
-  try{ sendEmail(to, subject, lines.join('\n'), 'new_order', o.no); }catch(_){}
+  let _body=''; try{ _body=buildOrderText(o); }catch(_){ _body=''; } if(!_body) _body=lines.join('\n'); // 與 Telegram 同一格式 same format as Telegram
+  try{ sendEmail(to, subject, _body, 'new_order', o.no); }catch(_){}
 }
 // 判斷觸發者是否已登入系統。是 -> 不重複發 Email/Telegram(人已在系統內,通知多餘)。
 // Whether the actor is logged into the system. If so, suppress Email/Telegram (they are already inside).
@@ -8166,7 +8167,8 @@ function buildOrderText(order){
     nav:(_addr&&_addr!=='-'?navUrl(_addr):''),
     door:_door
   };
-  var def='🔔 【'+bn+'】新工單 New Service Order · '+vals.no+'\n\n'+
+  var def='🔔 【'+bn+'自動報單系統】新工單 New Service Order · '+vals.no+'\n\n'+
+    '👉 師父維修工單站 Repair Station（點入直接更改工單 tap to open & update）：\n'+vals.link+'\n\n'+
     '負責人您好 Dear Owner，\n\n'+
     '收到一張新的工單，詳情如下：\nA new service order has been created:\n'+
     '════════════════════\n'+
@@ -8182,10 +8184,8 @@ function buildOrderText(order){
     '服務地址 Address    ：'+vals.address+
     (vals.door?('\n🔑 門鎖密碼 Door Code ：'+vals.door):'')+
     (vals.notes?('\n備註 Notes          ：'+vals.notes):'')+'\n'+
-    '════════════════════\n\n'+
-    (vals.nav?('📍 一鍵導航 Google 地圖 Open in Google Maps：\n'+vals.nav+'\n\n'):'')+
-    '👉 師父維修工單站 Repair Station（點入直接更改工單 tap to open & update）：\n'+vals.link+'\n\n'+
-    '此通知由系統自動發送。This notification was sent automatically.';
+    '════════════════════'+
+    (vals.nav?('\n\n📍 一鍵導航 Google 地圖 Open in Google Maps：\n'+vals.nav):'');
   var tpl=(config.n8nTextTpl||'').trim();
   if(!tpl) return def;
   // 佔位符替換 placeholder replacement
