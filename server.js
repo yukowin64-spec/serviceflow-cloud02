@@ -6,7 +6,9 @@
  *  - 派靜態前端 (public/index.html)  Serve static frontend
  *  - GET  /api/health   健康檢查      Health check
  *  - GET  /api/state    讀取整包雲端資料  Read full cloud state
- *  - PUT  /api/state    儲存整包雲端資料  Save full cloud state
+ *  - PUT  /api/state    儲存整包雲端資料(伺服器合併,防止互相覆蓋)Save full cloud state (server-side merge)
+ *  - GET  /api/version  輕量版本號 Lightweight version check
+ *  - POST /api/orders   即時儲存單一新工單 Save one new order atomically
  *  - POST /api/send-email  透過 SMTP 發郵件  Send email via SMTP
  *  - 伺服器端每日排程(24小時自動運行,無需任何人登入)
  *    Server-side daily scheduler (runs 24/7, no login required)
@@ -86,18 +88,155 @@ app.get('/api/state', async (req, res) => {
   }
 });
 
+// ================= 伺服器端合併 Server-side merge (v1.9.7) =================
+// 防止多部裝置同時儲存時互相覆蓋,導致工單「消失」。
+// Prevents devices from overwriting each other's writes (which made orders "disappear").
+function _arr(x){ return Array.isArray(x) ? x : []; }
+function _deletedSet(inner){
+  // 刪除記錄 tombstones:deletedOrders + 舊版「刪除工單」日誌 legacy delete_order logs
+  const m = new Map();
+  _arr(inner && inner.deletedOrders).forEach(t => { if (t && t.no) m.set(String(t.no), Math.max(Number(t.ts) || 0, m.get(String(t.no)) || 0)); });
+  _arr(inner && inner.logs).forEach(l => { if (l && l.action === 'delete_order' && l.target) { const k = String(l.target); if (!m.has(k)) m.set(k, 0); } });
+  return m;
+}
+function mergeInner(dbInner, inInner) {
+  dbInner = dbInner || {}; inInner = inInner || {};
+  const out = Object.assign({}, dbInner, inInner); // 其他資料:以送來嘅為準 other arrays: incoming wins (unchanged behaviour)
+  let merged = false;
+  // 刪除記錄合併 merge tombstones (keep 120 days)
+  const tmap = new Map();
+  _arr(dbInner.deletedOrders).concat(_arr(inInner.deletedOrders)).forEach(t => {
+    if (!t || !t.no) return; const k = String(t.no); const ts = Number(t.ts) || 0;
+    if (!tmap.has(k) || ts > tmap.get(k).ts) tmap.set(k, { no: k, ts });
+  });
+  const cutoff = Date.now() - 120 * 86400000;
+  out.deletedOrders = Array.from(tmap.values()).filter(t => t.ts >= cutoff).slice(-3000);
+  // 工單:按單號合併,較新 _ts 勝;刪除記錄會移除工單 orders: merge by no, newest _ts wins, tombstones remove
+  const dbOrders = _arr(dbInner.orders), inOrders = _arr(inInner.orders);
+  const legacyDel = new Map([..._deletedSet(dbInner), ..._deletedSet(inInner)]);
+  const map = new Map();
+  dbOrders.forEach(o => { if (o && o.no) map.set(String(o.no), o); });
+  const inKeys = new Set();
+  inOrders.forEach(o => {
+    if (!o || !o.no) return; const k = String(o.no); inKeys.add(k);
+    const cur = map.get(k);
+    if (!cur) {
+      // 已刪除嘅舊單唔好被舊裝置「復活」 don't let a stale device resurrect a deleted order
+      if (legacyDel.has(k) && (Number(o._ts) || 0) <= (tmap.has(k) ? tmap.get(k).ts : Infinity)) { merged = true; return; }
+      map.set(k, o);
+    } else if ((Number(o._ts) || 0) >= (Number(cur._ts) || 0)) { map.set(k, o); }
+    else merged = true;
+  });
+  for (const k of map.keys()) if (!inKeys.has(k)) merged = true; // 伺服器有、裝置冇 → 保留 kept server-only orders
+  // 套用刪除記錄 apply tombstones
+  for (const [k, t] of tmap) { const o = map.get(k); if (o && (Number(o._ts) || 0) <= t.ts) map.delete(k); }
+  // 保持原有次序:新單在前 keep newest-first order
+  const order = [];
+  const seen = new Set();
+  inOrders.forEach(o => { if (o && o.no && map.has(String(o.no)) && !seen.has(String(o.no))) { order.push(map.get(String(o.no))); seen.add(String(o.no)); } });
+  const extra = [];
+  for (const [k, o] of map) if (!seen.has(k)) extra.push(o);
+  out.orders = extra.concat(order);
+  // 日誌 logs:按 ts|action|target 去重 dedupe, newest first, keep 1000
+  const lk = x => ((x && x.ts) || '') + '|' + ((x && x.action) || '') + '|' + ((x && x.target) || '');
+  const lmap = new Map(); _arr(dbInner.logs).forEach(x => lmap.set(lk(x), x)); _arr(inInner.logs).forEach(x => lmap.set(lk(x), x));
+  if (lmap.size !== _arr(inInner.logs).length) merged = true;
+  out.logs = Array.from(lmap.values()).sort((a, b) => ((b.ts || '') < (a.ts || '') ? -1 : ((b.ts || '') > (a.ts || '') ? 1 : 0))).slice(0, 1000);
+  // 通知 / 郵件記錄:按 id 合併 notifications / emailLog by id
+  ['notifications', 'emailLog'].forEach(key => {
+    const m = new Map(); _arr(dbInner[key]).forEach(x => x && x.id && m.set(x.id, x)); _arr(inInner[key]).forEach(x => x && x.id && m.set(x.id, x));
+    if (m.size !== _arr(inInner[key]).length) merged = true;
+    out[key] = Array.from(m.values()).sort((a, b) => ((b.ts || '') < (a.ts || '') ? -1 : ((b.ts || '') > (a.ts || '') ? 1 : 0))).slice(0, 300);
+  });
+  return { inner: out, merged };
+}
+function mergeStoreObj(dbStore, inStore) {
+  dbStore = dbStore || {}; inStore = inStore || {};
+  const dseq = dbStore.seq || {}, iseq = inStore.seq || {};
+  const seq = {
+    uidSeq: Math.max(Number(dseq.uidSeq) || 0, Number(iseq.uidSeq) || 0),
+    cidSeq: Math.max(Number(dseq.cidSeq) || 0, Number(iseq.cidSeq) || 0),
+  };
+  const r = mergeInner(dbStore.store, inStore.store);
+  return { store: { seq, store: r.inner }, merged: r.merged };
+}
+
+// ---- 輕量版本號 Lightweight version check (poll without downloading everything) ----
+app.get('/api/version', async (req, res) => {
+  try {
+    const r = await pool.query('SELECT updated_at FROM app_state WHERE workspace = $1', [wsKey(req)]);
+    res.set('Cache-Control', 'no-store');
+    res.json({ found: r.rows.length > 0, updated_at: r.rows.length ? r.rows[0].updated_at : null });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// ---- 即時儲存單一新工單 Save ONE new order atomically (front page submits) ----
+// 工單先存入資料庫,成功後前端先發 Telegram/Email,確保「有通知就一定有單」。
+// The order is saved first; only after success does the client send notifications.
+app.post('/api/orders', async (req, res) => {
+  const ws = wsKey(req);
+  const { order, log, notification, dedupeInspection } = req.body || {};
+  if (!order || !order.no) return res.status(400).json({ ok: false, error: 'missing order' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const r = await client.query('SELECT store FROM app_state WHERE workspace = $1 FOR UPDATE', [ws]);
+    if (!r.rows.length) { await client.query('ROLLBACK'); return res.status(409).json({ ok: false, error: 'no state yet' }); }
+    const st = r.rows[0].store || {}; const inner = Object.assign({}, st.store || {});
+    const orders = _arr(inner.orders).slice();
+    const k = String(order.no);
+    const idx = orders.findIndex(o => o && String(o.no) === k);
+    if (idx < 0 && dedupeInspection && order.machineId) {
+      const dup = orders.find(o => o && o.kind === 'inspection' && o.machineId === order.machineId && o.status !== 'completed' && o.status !== 'cancelled');
+      if (dup) { await client.query('ROLLBACK'); return res.json({ ok: true, duplicate: true, existing: dup.no }); }
+    }
+    let existed = idx >= 0;
+    if (existed) { if ((Number(order._ts) || 0) >= (Number(orders[idx]._ts) || 0)) orders[idx] = order; }
+    else orders.unshift(order);
+    inner.orders = orders;
+    // 移除同單號嘅刪除記錄(如果係新建)clear a tombstone with the same no for a brand-new order
+    if (!existed) inner.deletedOrders = _arr(inner.deletedOrders).filter(t => !t || String(t.no) !== k);
+    if (log && log.ts) {
+      const lk = x => ((x && x.ts) || '') + '|' + ((x && x.action) || '') + '|' + ((x && x.target) || '');
+      const logs = _arr(inner.logs); if (!logs.some(x => lk(x) === lk(log))) inner.logs = [log].concat(logs).slice(0, 1000);
+    }
+    if (notification && notification.id) {
+      const ns = _arr(inner.notifications); if (!ns.some(x => x && x.id === notification.id)) inner.notifications = [notification].concat(ns).slice(0, 300);
+    }
+    const newStore = Object.assign({}, st, { store: inner });
+    const w = await client.query('UPDATE app_state SET store = $2::jsonb, updated_at = now() WHERE workspace = $1 RETURNING updated_at', [ws, JSON.stringify(newStore)]);
+    await client.query('COMMIT');
+    res.json({ ok: true, existed, updated_at: w.rows[0].updated_at });
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    console.error('[POST /api/orders]', e);
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  } finally { client.release(); }
+});
+
 // ---- 儲存整包資料 Save state ----
 // body: { config?: {...}, store?: {...} }  只更新提供咗嘅部分 Only provided parts are updated
 app.put('/api/state', async (req, res) => {
   try {
     const ws = wsKey(req);
-    const { config, store } = req.body || {};
+    const { config, replace } = req.body || {};
+    let { store } = req.body || {};
     if (config === undefined && store === undefined) {
       return res.status(400).json({ error: 'config 或 store 至少要有一個 need at least one of config/store' });
     }
-    // Upsert:存在就更新提供咗嘅欄位,唔存在就插入。
-    // Upsert: update provided columns if row exists, else insert.
-    const r = await pool.query(
+    // v1.9.7:喺交易入面鎖住資料列,同資料庫最新版本合併後先寫入(還原備份 replace=true 例外)。
+    // v1.9.7: lock the row in a transaction and merge with the latest DB copy before writing (except backup restore, replace=true).
+    const client = await pool.connect();
+    let merged = false, r;
+    try {
+      await client.query('BEGIN');
+      if (store !== undefined && !replace) {
+        const cur = await client.query('SELECT store FROM app_state WHERE workspace = $1 FOR UPDATE', [ws]);
+        if (cur.rows.length && cur.rows[0].store && cur.rows[0].store.store) {
+          const m = mergeStoreObj(cur.rows[0].store, store); store = m.store; merged = m.merged;
+        }
+      }
+    r = await client.query(
       `INSERT INTO app_state (workspace, config, store, updated_at)
        VALUES ($1, COALESCE($2::jsonb, '{}'::jsonb), COALESCE($3::jsonb, '{}'::jsonb), now())
        ON CONFLICT (workspace) DO UPDATE SET
@@ -107,7 +246,10 @@ app.put('/api/state', async (req, res) => {
        RETURNING updated_at`,
       [ws, config === undefined ? null : JSON.stringify(config), store === undefined ? null : JSON.stringify(store)]
     );
-    res.json({ ok: true, updated_at: r.rows[0].updated_at });
+      await client.query('COMMIT');
+    } catch (e) { try { await client.query('ROLLBACK'); } catch (_) {} throw e; }
+    finally { client.release(); }
+    res.json({ ok: true, updated_at: r.rows[0].updated_at, merged });
   } catch (e) {
     console.error('[PUT /api/state]', e);
     res.status(500).json({ error: String(e.message || e) });
@@ -242,8 +384,9 @@ async function runDailyDigestServer(ws, config, store) {
   const bn = config.brandName || 'Sunshine Laundry Group';
   const t = hkNow();
   const today = t.date;
-  const orders = (store && store.orders) || [];
-  const companies = (store && store.companies) || [];
+  const _inner = (store && store.store) || store || {}; // 資料喺 store.store 入面 data lives in store.store
+  const orders = _inner.orders || [];
+  const companies = _inner.companies || [];
   const allUnfinished = orders.filter(o => o.status !== 'completed' && o.status !== 'cancelled');
 
   let companiesSent = 0, ordersCovered = 0;
@@ -352,13 +495,24 @@ async function runDailyDigestServer(ws, config, store) {
         ' · N8N ' + (config.n8nEnabled && config.n8nUrl ? '已轉發 relayed' : '未啟用 off'),
       actor: 'system',
     };
-    const newStore = Object.assign({}, store, { logs: [logEntry].concat((store && store.logs) || []).slice(0, 5000) });
-    await pool.query(
-      `INSERT INTO app_state (workspace, config, store, updated_at)
-       VALUES ($1, $2::jsonb, $3::jsonb, now())
-       ON CONFLICT (workspace) DO UPDATE SET config=$2::jsonb, store=$3::jsonb, updated_at=now()`,
-      [ws, JSON.stringify(newConfig), JSON.stringify(newStore)]
-    );
+    // v1.9.7:重新讀取最新資料再寫入,唔會覆蓋發送期間新落嘅工單。Re-read latest inside a transaction so orders created meanwhile are kept.
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const cur = await client.query('SELECT config, store FROM app_state WHERE workspace = $1 FOR UPDATE', [ws]);
+      if (cur.rows.length) {
+        const cfg2 = Object.assign({}, cur.rows[0].config || {}, { digestLastSent: today });
+        const st2 = cur.rows[0].store || {};
+        if (st2.logs) delete st2.logs; // 清走舊版放錯位置嘅日誌 remove legacy misplaced logs
+        const inner2 = Object.assign({}, st2.store || {});
+        logEntry.user = 'system'; logEntry.target = logEntry.action; logEntry.action = 'notify';
+        inner2.logs = [logEntry].concat(_arr(inner2.logs)).slice(0, 1000);
+        st2.store = inner2;
+        await client.query('UPDATE app_state SET config=$2::jsonb, store=$3::jsonb, updated_at=now() WHERE workspace=$1', [ws, JSON.stringify(cfg2), JSON.stringify(st2)]);
+      }
+      await client.query('COMMIT');
+    } catch (e2) { try { await client.query('ROLLBACK'); } catch (_) {} throw e2; }
+    finally { client.release(); }
   } catch (e) {
     console.warn('[scheduler] 寫回 digestLastSent 失敗 persist failed:', String(e.message || e));
   }

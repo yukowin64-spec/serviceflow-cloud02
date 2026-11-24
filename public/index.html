@@ -3388,7 +3388,7 @@ let uidSeq = 100, cidSeq = 100;
 
 /* ================= APP VERSION ================= */
 /* 系統版本號 App version — 顯示於首頁與登入頁頁尾 shown in front/login page footer */
-const APP_VERSION = 'v1.9.6';
+const APP_VERSION = 'v1.9.7';
 const APP_BUILD = '2026-11-10';
 function applyAppVersion(){
   try{
@@ -3437,8 +3437,58 @@ function reopenOrderClearCompletion(o){
 // a past race left it half-completed. Treat completedAt as authoritative and set status back to completed.
 function _healOrders(){ try{ (store.orders||[]).forEach(function(o){ if(o && o.completedAt && o.status!=='completed' && o.status!=='cancelled'){ o.status='completed'; if(!o.completedBy) o.completedBy=o.assignedTech||'system'; } }); }catch(e){} }
 // Persist the full data store (companies/machines/orders/users/parts/logs) so edits survive page reload / logout
-function saveStore(){ try{ safeStore.setItem('vf_store', JSON.stringify({ seq:{uidSeq:uidSeq,cidSeq:cidSeq}, store:{ companies:store.companies, machines:store.machines, orders:store.orders, users:store.users, parts:store.parts, warehouses:store.warehouses, whMachines:store.whMachines, itAssets:store.itAssets, notifications:store.notifications, emailLog:store.emailLog, logs:store.logs } })); }catch(e){} try{ if(typeof CLOUD!=='undefined') CLOUD.pushDebounced(); }catch(e){} }
-function loadStore(){ try{ const s=safeStore.getItem('vf_store'); if(!s) return; const o=JSON.parse(s); if(o&&o.store){ if(Array.isArray(o.store.companies)) store.companies=o.store.companies; if(Array.isArray(o.store.machines)) store.machines=o.store.machines; if(Array.isArray(o.store.orders)) store.orders=o.store.orders; if(Array.isArray(o.store.users)&&o.store.users.length) store.users=o.store.users; if(Array.isArray(o.store.parts)) store.parts=o.store.parts; if(Array.isArray(o.store.warehouses)) store.warehouses=o.store.warehouses; if(Array.isArray(o.store.whMachines)) store.whMachines=o.store.whMachines; if(Array.isArray(o.store.itAssets)) store.itAssets=o.store.itAssets; if(Array.isArray(o.store.notifications)) store.notifications=o.store.notifications; if(Array.isArray(o.store.emailLog)) store.emailLog=o.store.emailLog; if(Array.isArray(o.store.logs)) store.logs=o.store.logs; } if(o&&o.seq){ if(typeof o.seq.uidSeq==='number') uidSeq=o.seq.uidSeq; if(typeof o.seq.cidSeq==='number') cidSeq=o.seq.cidSeq; } }catch(e){} }
+function saveStore(){ try{ safeStore.setItem('vf_store', JSON.stringify({ seq:{uidSeq:uidSeq,cidSeq:cidSeq}, store:{ companies:store.companies, machines:store.machines, orders:store.orders, users:store.users, parts:store.parts, warehouses:store.warehouses, whMachines:store.whMachines, itAssets:store.itAssets, notifications:store.notifications, emailLog:store.emailLog, logs:store.logs, deletedOrders:(store.deletedOrders||[]) } })); }catch(e){} try{ if(typeof CLOUD!=='undefined') CLOUD.pushDebounced(); }catch(e){} }
+function loadStore(){ try{ const s=safeStore.getItem('vf_store'); if(!s) return; const o=JSON.parse(s); if(o&&o.store){ if(Array.isArray(o.store.companies)) store.companies=o.store.companies; if(Array.isArray(o.store.machines)) store.machines=o.store.machines; if(Array.isArray(o.store.orders)) store.orders=o.store.orders; if(Array.isArray(o.store.users)&&o.store.users.length) store.users=o.store.users; if(Array.isArray(o.store.parts)) store.parts=o.store.parts; if(Array.isArray(o.store.warehouses)) store.warehouses=o.store.warehouses; if(Array.isArray(o.store.whMachines)) store.whMachines=o.store.whMachines; if(Array.isArray(o.store.itAssets)) store.itAssets=o.store.itAssets; if(Array.isArray(o.store.notifications)) store.notifications=o.store.notifications; if(Array.isArray(o.store.emailLog)) store.emailLog=o.store.emailLog; if(Array.isArray(o.store.logs)) store.logs=o.store.logs; if(Array.isArray(o.store.deletedOrders)) store.deletedOrders=o.store.deletedOrders; } if(o&&o.seq){ if(typeof o.seq.uidSeq==='number') uidSeq=o.seq.uidSeq; if(typeof o.seq.cidSeq==='number') cidSeq=o.seq.cidSeq; } }catch(e){} }
+/* ===== v1.9.7 工單防遺失 Order loss protection =====
+   1) 刪除記錄 tombstones:刪除嘅工單唔會被其他裝置「復活」。Deleted orders are not resurrected by other devices.
+   2) 新工單待上傳清單 outbox:新單先即時存入雲端資料庫,成功後先發 Telegram / Email。
+      New orders are saved to the cloud DB first; notifications are sent only after the save succeeds. */
+if(!Array.isArray(store.deletedOrders)) store.deletedOrders=[];
+function _tombMap(){ var m=new Map(); (store.deletedOrders||[]).forEach(function(t){ if(t&&t.no){ var k=String(t.no); m.set(k, Math.max(Number(t.ts)||0, m.get(k)||0)); } }); return m; }
+function _mergeTombs(cloudList){
+  var m=new Map(); (store.deletedOrders||[]).concat(Array.isArray(cloudList)?cloudList:[]).forEach(function(t){ if(!t||!t.no) return; var k=String(t.no), ts=Number(t.ts)||0; if(!m.has(k)||ts>m.get(k).ts) m.set(k,{no:k,ts:ts}); });
+  var cutoff=Date.now()-120*86400000; store.deletedOrders=Array.from(m.values()).filter(function(t){return t.ts>=cutoff;}).slice(-3000);
+}
+function _applyTombs(){ var m=_tombMap(); if(!m.size) return; store.orders=(store.orders||[]).filter(function(o){ if(!o||!o.no) return true; var t=m.get(String(o.no)); return !(t!==undefined && (Number(o._ts)||0)<=t); }); }
+function _outboxGet(){ try{ var a=JSON.parse(safeStore.getItem('vf_outbox')||'[]'); return Array.isArray(a)?a:[]; }catch(e){ return []; } }
+function _outboxSet(a){ try{ safeStore.setItem('vf_outbox', JSON.stringify(a||[])); }catch(e){} }
+function _outboxHas(no){ return _outboxGet().some(function(x){ return x&&x.no===no; }); }
+function _outboxAdd(item){ var a=_outboxGet().filter(function(x){ return x&&x.no!==item.no; }); a.push(item); _outboxSet(a); }
+function _outboxRemove(no){ _outboxSet(_outboxGet().filter(function(x){ return x&&x.no!==no; })); }
+var _orderNotifiers={}; // 本次頁面嘅通知函數(重新開頁後用預設通知)in-page notifier callbacks
+function _defaultNotify(o){ try{ sendToN8n(o); }catch(_){} try{ notifyNewOrderEmail(o); }catch(_){} }
+// 新工單:先存雲端,成功先通知 New order: save to cloud first, then notify
+async function commitNewOrder(order, opts){
+  opts=opts||{};
+  if(opts.notify) _orderNotifiers[order.no]=opts.notify;
+  _outboxAdd({ no:order.no, notify:opts.silent?false:true, inspection:!!opts.dedupeInspection, at:Date.now() });
+  return await _flushOne(order.no);
+}
+var _flushing={};
+async function _flushOne(no){
+  if(_flushing[no]) return false; _flushing[no]=true;
+  try{
+    var item=_outboxGet().find(function(x){ return x&&x.no===no; }); if(!item) return true;
+    var o=(store.orders||[]).find(function(x){ return x&&x.no===no; });
+    if(!o){ _outboxRemove(no); return true; }
+    var log=(store.logs||[]).find(function(l){ return l&&l.target===no&&(l.action==='new_order'||l.action==='new_inspection'); })||null;
+    var noti=(store.notifications||[]).find(function(n){ return n&&n.orderNo===no; })||null;
+    var r=await CLOUD.saveOrder(o, log, noti, item.inspection);
+    if(!r) return false; // 網絡問題,稍後重試 network problem, retry later
+    _outboxRemove(no);
+    if(r.duplicate){
+      // 其他裝置已開咗同一部機嘅例行檢查單:移除本機重複單,唔再發通知。Another device already opened this inspection.
+      store.orders=store.orders.filter(function(x){ return x.no!==no; }); saveStoreLocalOnly(); try{ refreshAll(); }catch(_){}
+      delete _orderNotifiers[no]; return true;
+    }
+    if(item.notify){ var fn=_orderNotifiers[no]||_defaultNotify; try{ fn(o); }catch(_){} }
+    delete _orderNotifiers[no];
+    return true;
+  } finally { _flushing[no]=false; }
+}
+async function flushOrderOutbox(){ var a=_outboxGet(); for(var i=0;i<a.length;i++){ try{ await _flushOne(a[i].no); }catch(_){} } }
+function _saveFailHtml(no){ return '<br><span style="color:var(--color-error)">⚠ 網絡問題:工單 '+esc(no)+' 暫存喺呢部裝置,未上傳雲端。請保持頁面開啟,恢復網絡後會自動上傳並發出通知。Network problem: the order is kept on this device and will upload & notify automatically once online. Please keep this page open.</span>'; }
+
 /* ================= CLOUD SYNC (Zeabur + PostgreSQL) ================= */
 /* 雲端同步:所有裝置連同一個後端資料庫,還原一次全部裝置生效。
    Cloud sync: every device talks to the same backend DB, so a restore applies everywhere. */
@@ -3447,7 +3497,22 @@ const CLOUD = (function(){
   let pushTimer=null, lastErr=null, online=false;
   let lastVersion=null;      // 上次已知雲端版本(updated_at)Last known cloud version
   let suppressPullUntil=0;   // 剛推送後短暫唔好即刻被 pull 覆蓋 Avoid immediate self-overwrite
-  let pushing=false;
+  let pushing=false, pushAgain=false, replaceNext=false;
+  async function fetchVersion(){
+    try{ const r=await fetch(base+'/api/version',{cache:'no-store',headers:{'Accept':'application/json'}}); if(!r.ok) return undefined; const d=await r.json(); return d&&d.found?d.updated_at:null; }catch(e){ return undefined; }
+  }
+  // 即時儲存單一新工單(重試 3 次)Save one new order now (3 retries)
+  async function saveOrder(order, log, notification, dedupeInspection){
+    for(let i=0;i<3;i++){
+      try{
+        const r=await fetch(base+'/api/orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({order:order, log:log||null, notification:notification||null, dedupeInspection:!!dedupeInspection})});
+        if(r.ok){ const d=await r.json(); if(d&&d.ok){ online=true; return d; } }
+        if(r.status===409){ return null; }
+      }catch(e){}
+      await new Promise(res=>setTimeout(res, 1200*(i+1)));
+    }
+    online=false; return null;
+  }
   function setBadge(txt,color){ const b=document.getElementById('cloudBadge'); if(b){ b.textContent=txt; b.style.color=color; } }
   async function pull(){
     try{
@@ -3477,6 +3542,7 @@ const CLOUD = (function(){
     });
     return Array.from(map.values());
   }
+  try{ window.mergeById=mergeById; }catch(e){} // 畀 applyCloudState 用(以前搵唔到,輪詢更新靜靜失敗)expose for applyCloudState (was silently failing on poll)
   // 推送前先合併雲端最新資料,防止覆蓋另一部機嘅新增。Merge latest cloud data before pushing to avoid clobbering another device's additions.
   function mergeCloudIntoLocal(cloud){
     try{
@@ -3490,6 +3556,7 @@ const CLOUD = (function(){
       store.whMachines= mergeById(store.whMachines,cs.whMachines,'id');
       store.itAssets  = mergeById(store.itAssets,  cs.itAssets,  'id');
       store.notifications = mergeById(store.notifications, cs.notifications, 'id');
+      _mergeTombs(cs.deletedOrders); _applyTombs(); // 刪除記錄 tombstones
       // logs:按時間合併去重 merge logs by ts+action, keep newest 500
       const lk=x=>((x&&x.ts)||'')+'|'+((x&&x.action)||'')+'|'+((x&&x.target)||'');
       const lmap=new Map(); ((cs.logs)||[]).forEach(x=>lmap.set(lk(x),x)); (store.logs||[]).forEach(x=>lmap.set(lk(x),x));
@@ -3504,22 +3571,26 @@ const CLOUD = (function(){
     }catch(e){}
   }
   async function pushNow(){
-    if(pushing) return false; pushing=true;
+    if(pushing){ pushAgain=true; return false; } pushing=true; // 推送中再有改動:完成後再推一次(以前會被忽略)re-push after the current one instead of dropping it
     try{
-      // 先拉雲端最新,若比本地已知版本新,先合併再推(避免覆蓋)。
-      // Pull latest first; if newer than our known version, merge before pushing (prevents clobber).
+      // 先查版本號,只有雲端有更新先下載合併(慳流量、快好多)。Check version first; only download & merge when cloud changed.
       try{
-        const cur=await pull();
-        if(cur && cur.found && cur.updated_at && cur.updated_at!==lastVersion){ mergeCloudIntoLocal(cur); }
+        const v=await fetchVersion();
+        if(v===undefined || (v && v!==lastVersion)){
+          const cur=await pull();
+          if(cur && cur.found && cur.updated_at && cur.updated_at!==lastVersion){ mergeCloudIntoLocal(cur); }
+        }
       }catch(e){}
-      const payload={ config:config, store:{ seq:{uidSeq:uidSeq,cidSeq:cidSeq}, store:{ companies:store.companies, machines:store.machines, orders:store.orders, users:store.users, parts:store.parts, warehouses:store.warehouses, whMachines:store.whMachines, itAssets:store.itAssets, notifications:store.notifications, emailLog:store.emailLog, logs:store.logs } } };
+      const _isReplace=replaceNext; replaceNext=false;
+      const _ob=new Set(_outboxGet().map(function(x){return x.no;}));
+      const payload={ replace:_isReplace, config:config, store:{ seq:{uidSeq:uidSeq,cidSeq:cidSeq}, store:{ companies:store.companies, machines:store.machines, orders:(_ob.size?store.orders.filter(function(o){return !_ob.has(o.no);}):store.orders), users:store.users, parts:store.parts, warehouses:store.warehouses, whMachines:store.whMachines, itAssets:store.itAssets, notifications:store.notifications, emailLog:store.emailLog, logs:store.logs, deletedOrders:(store.deletedOrders||[]) } } };
       const r=await fetch(base+'/api/state',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
       if(!r.ok) throw new Error('HTTP '+r.status);
-      const d=await r.json(); if(d&&d.updated_at) lastVersion=d.updated_at;
+      const d=await r.json(); if(d&&d.updated_at) lastVersion=d.merged?null:d.updated_at; // 伺服器合併咗其他裝置資料 → 下次輪詢重新下載 server merged others' data → re-pull on next poll
       suppressPullUntil=Date.now()+1500; online=true; lastErr=null;
       setBadge('雲端已同步 Cloud synced','#0a7d4d'); return true;
     }catch(e){ online=false; lastErr=e; setBadge('離線(僅本機)Offline (local only)','#b45309'); return false; }
-    finally{ pushing=false; }
+    finally{ pushing=false; if(pushAgain){ pushAgain=false; pushDebounced(); } }
   }
   function pushDebounced(){ if(pushTimer) clearTimeout(pushTimer); pushTimer=setTimeout(function(){ pushTimer=null; pushNow(); },600); }
   // 輪詢:定期拉雲端,若版本較新就套用(唔會覆蓋你啱啱嘅本地改動)
@@ -3527,6 +3598,9 @@ const CLOUD = (function(){
   async function poll(){
     if(Date.now()<suppressPullUntil) return;      // 啱推送完,略過一次 just pushed, skip
     if(pushTimer) return;
+    try{ if(_outboxGet().length) flushOrderOutbox(); }catch(e){}
+    const v=await fetchVersion();
+    if(v!==undefined && v && v===lastVersion){ online=true; setBadge('雲端已連線 Cloud connected','#0a7d4d'); return; } // 冇更新,唔使下載 unchanged, skip download
     const d=await pull();
     if(!d){ setBadge('離線(僅本機)Offline (local only)','#b45309'); return; }
     if(d.found && d.updated_at && d.updated_at!==lastVersion){
@@ -3539,7 +3613,7 @@ const CLOUD = (function(){
   }
   function startPolling(ms){ setInterval(poll, ms||5000); }
   function noteVersion(v){ if(v) lastVersion=v; }
-  return { pull, pushNow, pushDebounced, poll, startPolling, noteVersion, get online(){return online;}, get lastErr(){return lastErr;}, get version(){return lastVersion;} };
+  return { pull, pushNow, pushDebounced, poll, startPolling, noteVersion, saveOrder, markReplace(){ replaceNext=true; }, get online(){return online;}, get lastErr(){return lastErr;}, get version(){return lastVersion;} };
 })();
 
 // 將雲端資料套用到本地 store/config 並重繪(seedIfEmpty=false 代表純套用)
@@ -3563,6 +3637,7 @@ function applyCloudState(d, seedLocalToo){
         if(Array.isArray(o.store.notifications)) store.notifications=o.store.notifications;
         if(Array.isArray(o.store.emailLog)) store.emailLog=o.store.emailLog;
         if(Array.isArray(o.store.logs)) store.logs=o.store.logs;
+        _mergeTombs(o.store.deletedOrders); _applyTombs(); // 刪除記錄 tombstones
       }
       if(o.seq){ if(typeof o.seq.uidSeq==='number') uidSeq=Math.max(uidSeq,o.seq.uidSeq); if(typeof o.seq.cidSeq==='number') cidSeq=Math.max(cidSeq,o.seq.cidSeq); }
       try{ if(typeof checkDueInspections==='function') checkDueInspections(); }catch(e){} // 雲端同步後也檢查到期例行檢查 also check after cloud sync
@@ -3583,10 +3658,10 @@ function applyCloudState(d, seedLocalToo){
     try{ if(typeof techOnCloudUpdate==='function') techOnCloudUpdate(); }catch(e){}
     try{ if(typeof adminOnCloudUpdate==='function') adminOnCloudUpdate(); }catch(e){}
     try{ if(typeof renderAdminBell==='function' && session) renderAdminBell(); }catch(e){}
-  }catch(e){}
+  }catch(e){ try{ console.warn('applyCloudState error', e); }catch(_){} }
 }
 
-function saveStoreLocalOnly(){ try{ safeStore.setItem('vf_store', JSON.stringify({ seq:{uidSeq:uidSeq,cidSeq:cidSeq}, store:{ companies:store.companies, machines:store.machines, orders:store.orders, users:store.users, parts:store.parts, warehouses:store.warehouses, whMachines:store.whMachines, itAssets:store.itAssets, notifications:store.notifications, emailLog:store.emailLog, logs:store.logs } })); }catch(e){} }
+function saveStoreLocalOnly(){ try{ safeStore.setItem('vf_store', JSON.stringify({ seq:{uidSeq:uidSeq,cidSeq:cidSeq}, store:{ companies:store.companies, machines:store.machines, orders:store.orders, users:store.users, parts:store.parts, warehouses:store.warehouses, whMachines:store.whMachines, itAssets:store.itAssets, notifications:store.notifications, emailLog:store.emailLog, logs:store.logs, deletedOrders:(store.deletedOrders||[]) } })); }catch(e){} }
 function saveConfigLocalOnly(){ try{ safeStore.setItem('vf_config', JSON.stringify(config)); }catch(e){} }
 function applyBranding(){
   document.querySelectorAll('.brand-name').forEach(el=>{ el.textContent = config.brandName || 'Sunshine Laundry Group'; });
@@ -4123,14 +4198,19 @@ function checkDueInspections(){
         try{ addLog('new_inspection', no, '設備 '+m.id+' 例行檢查（每 '+cyc+' 個月）'); }catch(_){}
         try{ pushNotification('new_order','technician',no,'例行檢查工單 Inspection order · '+no+'（'+companyName(m.companyId)+' / '+m.id+'）'); }catch(_){}
         // 保養例檢通知:依設定分別發送 Telegram / Email(可關閉)。Inspection notify: send TG / Email per settings (each toggleable).
-        try{ if(config.inspectNotifyTg!==false){ sendToN8n(order); } else { addLog('notify_skip', no, '例檢 Telegram 通知已關閉 inspection Telegram off'); } }catch(_){}
-        try{
-          if(config.inspectNotifyEmail!==false){
-            var _ic=store.companies.find(function(x){return x.id===m.companyId;});
-            var _ito=(_ic&&_ic.notifyEmail)?_ic.notifyEmail:(config.brandOwnerEmail||config.smtpAlertTo||'');
-            if(_ito){ sendEmail(_ito, '【'+(config.brandName||'Sunshine Laundry Group')+'】定期例行檢查工單 Inspection Order · '+no, buildOrderText(order), 'inspection', no); }
-          } else { addLog('notify_skip', no, '例檢 Email 通知已關閉 inspection Email off'); }
-        }catch(_){}
+        // v1.9.7:先存雲端(同一部機只會有一張未完成例檢單),成功先發通知。Save first (one open inspection per machine), then notify.
+        (function(order, m, no){
+          commitNewOrder(order, { dedupeInspection:true, notify:function(){
+            try{ if(config.inspectNotifyTg!==false){ sendToN8n(order); } else { addLog('notify_skip', no, '例檢 Telegram 通知已關閉 inspection Telegram off'); } }catch(_){}
+            try{
+              if(config.inspectNotifyEmail!==false){
+                var _ic=store.companies.find(function(x){return x.id===m.companyId;});
+                var _ito=(_ic&&_ic.notifyEmail)?_ic.notifyEmail:(config.brandOwnerEmail||config.smtpAlertTo||'');
+                if(_ito){ sendEmail(_ito, '【'+(config.brandName||'Sunshine Laundry Group')+'】定期例行檢查工單 Inspection Order · '+no, buildOrderText(order), 'inspection', no); }
+              } else { addLog('notify_skip', no, '例檢 Email 通知已關閉 inspection Email off'); }
+            }catch(_){}
+          }});
+        })(order, m, no);
         created++;
       }
       // 推進下次檢查日期至今天之後 roll nextInspect forward past today
@@ -4568,12 +4648,14 @@ $('#submitOrderBtn').addEventListener('click', () => {
   addLog('new_order', no, `公司 ${companyName(order.companyId)} / 機器 ${order.machineId} / ${urgency==='urgent'?'緊急':'非緊急'}`);
   pushNotification('new_order','technician',no,'新維修工單 New order · '+no+'（'+companyName(order.companyId)+' / '+order.machineId+'）'+(urgency==='urgent'?' · 緊急 URGENT':''));
   saveStore(); // FIX: persist locally + push to cloud so orders sync across devices
-  // 已登入系統時略過 Telegram/WhatsApp 通知(人已在系統內);未登入(客戶前台報修)才發送。
-  // Skip Telegram/WhatsApp when the submitter is logged in; only fire for public (not-logged-in) submissions.
-  try{ sendToN8n(order); }catch(_){}
-  try{ notifyNewOrderEmail(order); }catch(_){}
+  // v1.9.7:先將工單存入雲端資料庫,成功後先發 Telegram / Email。Save to cloud DB first, then notify.
+  const _fm=$('#frontMsg');
+  _fm.innerHTML=`<span style="color:var(--color-text-muted)">⏳ 儲存中… Saving… 工單編號 Order No: <strong>${no}</strong></span>`;
+  commitNewOrder(order).then(function(ok){
+    if(ok){ _fm.innerHTML=`<span style="color:var(--color-success)">提交成功 Submission successful · 工單編號 Order No: <strong>${no}</strong><br>下單時間 Order Date/Time: <strong>${order.created}</strong></span>`; }
+    else { _fm.innerHTML=`<span style="color:var(--color-warning,#b45309)">工單編號 Order No: <strong>${no}</strong></span>`+_saveFailHtml(no); }
+  });
   if(typeof renderOrders==='function' && session){ renderOrders(); renderDashboard(); }
-  $('#frontMsg').innerHTML=`<span style="color:var(--color-success)">提交成功 Submission successful · 工單編號 Order No: <strong>${no}</strong><br>下單時間 Order Date/Time: <strong>${order.created}</strong></span>`;
   toast('提交成功 Submitted: '+no);
   $('#issueDesc').value=''; $('#contactPerson').value=''; $('#contactValue').value=''; $('#bookingDate').value=''; $('#timeSlot').value=''; if($('#installDate')) $('#installDate').value=''; if($('#manualNo')) $('#manualNo').value='';
   setTimeout(()=>{ $('#orderForm').classList.add('hidden'); verifiedMachine=null; $('#lookupSelect').value=''; window.scrollTo({top:0,behavior:'smooth'}); },1800);
@@ -4715,10 +4797,11 @@ $('#inst_submit') && $('#inst_submit').addEventListener('click', ()=>{
   addLog('new_order', no, isIT ? `IT 安裝 IT Install / 公司 ${companyName(cid)} / ${itSummary}` : `新安裝 New Install / 公司 ${companyName(cid)} / 洗 ${qW} 乾 ${qD}`);
   pushNotification('new_order','technician',no,'新安裝工單 New install · '+no+'（'+companyName(cid)+'）');
   saveStore();
-  try{ sendToN8n(order); }catch(_){}
-  try{ notifyNewOrderEmail(order); }catch(_){}
+  msg.innerHTML=`<span style="color:var(--color-text-muted)">⏳ 儲存中… Saving… 工單編號 Order No: <strong>${no}</strong></span>`;
+  commitNewOrder(order).then(function(ok){
+    msg.innerHTML = ok ? `<span style="color:var(--color-success)">提交成功 Submitted · 工單編號 Order No: <strong>${no}</strong></span>` : (`<span style="color:var(--color-warning,#b45309)">工單編號 Order No: <strong>${no}</strong></span>`+_saveFailHtml(no));
+  });
   if(typeof renderOrders==='function' && session){ renderOrders(); renderDashboard(); }
-  msg.innerHTML=`<span style="color:var(--color-success)">提交成功 Submitted · 工單編號 Order No: <strong>${no}</strong></span>`;
   toast('新安裝工單已提交 Install order submitted: '+no);
   $('#inst_qtyWash').value='0'; $('#inst_qtyDry').value='0'; $('#inst_date').value=''; $('#inst_notes').value=''; if($('#inst_pickWH')){ $('#inst_pickWH').checked=false; const w=$('#inst_whWrap'); if(w) w.classList.add('hidden'); }
   ['inst_itPos','inst_itPc','inst_itCamAudio','inst_itCamNormal','inst_itRecDays'].forEach(function(id){ var el=$('#'+id); if(el) el.value='0'; }); if($('#inst_itAddr')) $('#inst_itAddr').value=''; if($('#inst_itSlot')) $('#inst_itSlot').value='';
@@ -4738,10 +4821,11 @@ $('#ext_submit') && $('#ext_submit').addEventListener('click', ()=>{
   addLog('new_order', no, `外客 External / ${nm} / ${ph}`);
   pushNotification('new_order','technician',no,'外客工單 External order · '+no+'（'+nm+'）'+(urg==='urgent'?' · 緊急 URGENT':''));
   saveStore();
-  try{ sendToN8n(order); }catch(_){}
-  try{ notifyNewOrderEmail(order); }catch(_){}
+  msg.innerHTML=`<span style="color:var(--color-text-muted)">⏳ 儲存中… Saving… 工單編號 Order No: <strong>${no}</strong></span>`;
+  commitNewOrder(order).then(function(ok){
+    msg.innerHTML = ok ? `<span style="color:var(--color-success)">提交成功 Submitted · 工單編號 Order No: <strong>${no}</strong></span>` : (`<span style="color:var(--color-warning,#b45309)">工單編號 Order No: <strong>${no}</strong></span>`+_saveFailHtml(no));
+  });
   if(typeof renderOrders==='function' && session){ renderOrders(); renderDashboard(); }
-  msg.innerHTML=`<span style="color:var(--color-success)">提交成功 Submitted · 工單編號 Order No: <strong>${no}</strong></span>`;
   toast('外客工單已提交 External order submitted: '+no);
   $('#ext_name').value=''; $('#ext_phone').value=''; $('#ext_addr').value=''; $('#ext_reason').value='';
 });
@@ -5558,6 +5642,8 @@ function deleteOrder(no){
   const o=store.orders.find(x=>x.no===no); if(!o)return;
   confirmModal('刪除工單 Delete Order', `確定刪除工單 <b>${esc(no)}</b>？此操作會記錄在日誌。Delete order <b>${esc(no)}</b>? This will be logged.`, ()=>{
     store.orders=store.orders.filter(x=>x.no!==no);
+    if(!Array.isArray(store.deletedOrders)) store.deletedOrders=[];
+    store.deletedOrders.push({no:no, ts:Date.now()}); _outboxRemove(no); // 刪除記錄,防止其他裝置復活 tombstone
     addLog('delete_order', no, `公司 ${companyName(o.companyId)} / 機器 ${o.machineId}`);
     refreshAll(); toast('工單已刪除 Order deleted');
   });
@@ -7896,6 +7982,8 @@ function applyRestore(obj){
   store.itAssets     = Array.isArray(obj.store.itAssets)     ? obj.store.itAssets     : [];
   store.notifications= Array.isArray(obj.store.notifications)? obj.store.notifications: [];
   store.emailLog     = Array.isArray(obj.store.emailLog)     ? obj.store.emailLog     : [];
+  store.deletedOrders = [];
+  try{ CLOUD.markReplace(); }catch(_){} // 還原備份:雲端整份取代 restore replaces cloud data wholesale
   if(obj.config && typeof obj.config==='object') config = Object.assign(config, obj.config);
   if(obj.seq){ if(typeof obj.seq.uidSeq==='number') uidSeq=obj.seq.uidSeq; if(typeof obj.seq.cidSeq==='number') cidSeq=obj.seq.cidSeq; }
   _healOrders(); // 還原後自愈矛盾工單(例如有 completedAt 但 status 非 completed)heal contradictory orders after restore
@@ -8781,7 +8869,8 @@ loadStore(); // 先用本機資料快速顯示 fast local paint first
 applyBranding();
 applyAppVersion(); // 套用版本號至頁尾 apply version number to footers
 fillSettingsForm();
-try{ checkDueInspections(); }catch(e){} // 到期例行檢查自動開單 auto-create due inspection orders
+// v1.9.7:唔再喺雲端資料未到之前用本機(或示範)資料開例檢單,避免向示範郵箱發通知。
+// No longer run inspections on local/demo data before cloud data arrives (prevented emails to demo addresses).
 handleQRParam(); // QR scan: auto-select machine & jump to order form if ?m= present
 try{ tryRestoreSession(); }catch(e){} // 更新頁面/按連結後,用本機資料先還原登入 restore login from local first
 
@@ -8798,12 +8887,32 @@ setTimeout(hideBootOverlay, 3500);
   const d = await CLOUD.pull();
   if(d && d.found){
     CLOUD.noteVersion(d.updated_at);
-    applyCloudState(d, true); // 初次開 app:雲端優先直接採用雲端全部工單(seed);之後的輪詢才用時間戳合併 first load takes cloud orders wholesale; later polls merge
+    // v1.9.7 救回未上傳嘅工單 rescue orders on this device that never reached the cloud
+    var _rescue=[];
+    try{
+      var _cs=(d.store&&d.store.store)||{}; var _cNos=new Set((_cs.orders||[]).map(function(o){return o&&o.no;}));
+      var _del=new Set(); (_cs.deletedOrders||[]).forEach(function(t){ if(t&&t.no) _del.add(String(t.no)); }); (_cs.logs||[]).forEach(function(l){ if(l&&l.action==='delete_order'&&l.target) _del.add(String(l.target)); });
+      var _cm=new Map(); (_cs.machines||[]).forEach(function(m){ if(m&&m.id) _cm.set(m.id, m.companyId); });
+      var _cc=new Set((_cs.companies||[]).map(function(c){return c&&c.id;}));
+      var _ob=new Set(_outboxGet().map(function(x){return x.no;}));
+      var _d3=new Date(Date.now()-3*86400000); var _since=_d3.getFullYear()+'-'+String(_d3.getMonth()+1).padStart(2,'0')+'-'+String(_d3.getDate()).padStart(2,'0');
+      (store.orders||[]).forEach(function(o){
+        if(!o||!o.no||_cNos.has(o.no)||_del.has(String(o.no))) return;
+        if(_ob.has(o.no)){ _rescue.push(o); return; }
+        var legacy = ['repair','install','external'].indexOf(o.kind||'repair')>=0 && String(o.created||'')>=_since && !!o._ts
+          && (o.machineId ? _cm.get(o.machineId)===o.companyId : _cc.has(o.companyId));
+        if(legacy){ _rescue.push(o); _outboxAdd({no:o.no, notify:false, inspection:false, at:Date.now(), rescued:true}); } // 舊單已發過通知,唔再發 already notified before
+      });
+    }catch(e){}
+    applyCloudState(d, true);
+    if(_rescue.length){ _rescue.forEach(function(o){ if(!store.orders.some(function(x){return x.no===o.no;})) store.orders.unshift(o); }); saveStoreLocalOnly(); try{ refreshAll(); }catch(_){} }
+    setTimeout(function(){ flushOrderOutbox(); }, 300); // 初次開 app:雲端優先直接採用雲端全部工單(seed);之後的輪詢才用時間戳合併 first load takes cloud orders wholesale; later polls merge
     const badge=document.getElementById('cloudBadge'); if(badge){ badge.textContent='雲端已連線 Cloud connected'; badge.style.color='#0a7d4d'; }
   } else if(d && !d.found){
     // 雲端係空(第一次用):將本機現有資料推上雲端做初始化。
     // Cloud empty (first run): seed cloud with whatever is local now.
     await CLOUD.pushNow();
+    try{ checkDueInspections(); }catch(e){}
     const badge=document.getElementById('cloudBadge'); if(badge){ badge.textContent='雲端已初始化 Cloud initialized'; badge.style.color='#0a7d4d'; }
   } else {
     const badge=document.getElementById('cloudBadge'); if(badge){ badge.textContent='離線(僅本機)Offline (local only)'; badge.style.color='#b45309'; }
