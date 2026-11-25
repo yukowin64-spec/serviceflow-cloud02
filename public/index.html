@@ -3395,7 +3395,7 @@ let uidSeq = 100, cidSeq = 100;
 
 /* ================= APP VERSION ================= */
 /* 系統版本號 App version — 顯示於首頁與登入頁頁尾 shown in front/login page footer */
-const APP_VERSION = 'v2.0.0';
+const APP_VERSION = 'v2.0.1';
 const APP_BUILD = '2026-11-10';
 function applyAppVersion(){
   try{
@@ -3468,21 +3468,33 @@ function _defaultNotify(o){ try{ sendToN8n(o); }catch(_){} try{ notifyNewOrderEm
 async function commitNewOrder(order, opts){
   opts=opts||{};
   if(opts.notify) _orderNotifiers[order.no]=opts.notify;
-  _outboxAdd({ no:order.no, notify:opts.silent?false:true, inspection:!!opts.dedupeInspection, at:Date.now() });
+  _outboxAdd({ no:order.no, notify:opts.silent?false:true, inspection:!!opts.dedupeInspection, at:Date.now(), isNew:true });
   return await _flushOne(order.no);
 }
 var _flushing={};
 async function _flushOne(no){
-  if(_flushing[no]) return false; _flushing[no]=true;
+  var _fkey=no;
+  if(_flushing[_fkey]) return false; _flushing[_fkey]=true;
   try{
     var item=_outboxGet().find(function(x){ return x&&x.no===no; }); if(!item) return true;
     var o=(store.orders||[]).find(function(x){ return x&&x.no===no; });
     if(!o){ _outboxRemove(no); return true; }
     var log=(store.logs||[]).find(function(l){ return l&&l.target===no&&(l.action==='new_order'||l.action==='new_inspection'); })||null;
+    if(item.rescued){ log={ ts:nowStr(), user:'system', action:'rescue_order', target:no, detail:'由裝置補回雲端(之前未成功儲存)Restored to cloud from a device (was never saved)' }; try{ (store.logs=store.logs||[]).unshift(log); }catch(_){} }
     var noti=(store.notifications||[]).find(function(n){ return n&&n.orderNo===no; })||null;
-    var r=await CLOUD.saveOrder(o, log, noti, item.inspection);
+    var r=await CLOUD.saveOrder(o, log, noti, item.inspection, !!item.isNew);
     if(!r) return false; // 網絡問題,稍後重試 network problem, retry later
     _outboxRemove(no);
+    if(r.renamed && r.renamed!==no){
+      // 伺服器發現撞號,改用新單號(唔會蓋走其他單)server found a number clash and assigned a fresh number
+      var nn=r.renamed; o.no=nn;
+      (store.logs||[]).forEach(function(l){ if(l&&l.target===no) l.target=nn; });
+      (store.notifications||[]).forEach(function(x){ if(x&&x.orderNo===no){ x.orderNo=nn; if(typeof x.text==='string') x.text=x.text.split(no).join(nn); } });
+      if(_orderNotifiers[no]){ _orderNotifiers[nn]=_orderNotifiers[no]; delete _orderNotifiers[no]; }
+      saveStoreLocalOnly(); try{ refreshAll(); }catch(_){}
+      no=nn;
+    }
+    if(r.deleted){ store.orders=store.orders.filter(function(x){ return x.no!==no; }); saveStoreLocalOnly(); try{ refreshAll(); }catch(_){} delete _orderNotifiers[no]; return true; } // 已被刪除,唔補返 deleted elsewhere
     if(r.duplicate){
       // 其他裝置已開咗同一部機嘅例行檢查單:移除本機重複單,唔再發通知。Another device already opened this inspection.
       store.orders=store.orders.filter(function(x){ return x.no!==no; }); saveStoreLocalOnly(); try{ refreshAll(); }catch(_){}
@@ -3491,7 +3503,7 @@ async function _flushOne(no){
     if(item.notify){ var fn=_orderNotifiers[no]||_defaultNotify; try{ fn(o); }catch(_){} }
     delete _orderNotifiers[no];
     return true;
-  } finally { _flushing[no]=false; }
+  } finally { _flushing[_fkey]=false; }
 }
 async function flushOrderOutbox(){ var a=_outboxGet(); for(var i=0;i<a.length;i++){ try{ await _flushOne(a[i].no); }catch(_){} } }
 function _saveFailHtml(no){ return '<br><span style="color:var(--color-error)">⚠ 網絡問題:工單 '+esc(no)+' 暫存喺呢部裝置,未上傳雲端。請保持頁面開啟,恢復網絡後會自動上傳並發出通知。Network problem: the order is kept on this device and will upload & notify automatically once online. Please keep this page open.</span>'; }
@@ -3506,13 +3518,23 @@ const CLOUD = (function(){
   let suppressPullUntil=0;   // 剛推送後短暫唔好即刻被 pull 覆蓋 Avoid immediate self-overwrite
   let pushing=false, pushAgain=false, replaceNext=false;
   async function fetchVersion(){
-    try{ const r=await fetch(base+'/api/version',{cache:'no-store',headers:{'Accept':'application/json'}}); if(!r.ok) return undefined; const d=await r.json(); return d&&d.found?d.updated_at:null; }catch(e){ return undefined; }
+    try{ const r=await fetch(base+'/api/version',{cache:'no-store',headers:{'Accept':'application/json'}}); if(!r.ok) return undefined; const d=await r.json(); try{ _maybeReloadForUpdate(d&&d.appVersion); }catch(_){} return d&&d.found?d.updated_at:null; }catch(e){ return undefined; }
+  }
+  // 伺服器已更新新版:冇未上傳工單、冇填緊表就自動重新載入,避免舊版頁面繼續用。Auto-reload stale pages after a deploy.
+  var _reloadAsked=false;
+  function _maybeReloadForUpdate(v){
+    if(!v || typeof APP_VERSION==='undefined' || v===APP_VERSION || _reloadAsked) return;
+    if(_outboxGet().length || pushing || pushTimer) return;
+    var ae=document.activeElement; if(ae && /INPUT|TEXTAREA|SELECT/.test(ae.tagName||'')) return;
+    if(document.querySelector('.modal-backdrop:not(.hidden), #modal.open')) return;
+    _reloadAsked=true; try{ toast('系統已更新,重新載入中 Updating to '+v); }catch(_){}
+    setTimeout(function(){ location.reload(); }, 1200);
   }
   // 即時儲存單一新工單(重試 3 次)Save one new order now (3 retries)
-  async function saveOrder(order, log, notification, dedupeInspection){
+  async function saveOrder(order, log, notification, dedupeInspection, isNew){
     for(let i=0;i<3;i++){
       try{
-        const r=await fetch(base+'/api/orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({order:order, log:log||null, notification:notification||null, dedupeInspection:!!dedupeInspection})});
+        const r=await fetch(base+'/api/orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({order:order, log:log||null, notification:notification||null, dedupeInspection:!!dedupeInspection, isNew:!!isNew})});
         if(r.ok){ const d=await r.json(); if(d&&d.ok){ online=true; return d; } }
         if(r.status===409){ return null; }
       }catch(e){}
@@ -4173,11 +4195,20 @@ function inspectDue(m){
   var nx = m.nextInspect || computeNextInspect(m);
   return !!nx && nx <= todayStr();
 }
-/* 例行檢查工單編號 IN-YYYYMMDD-NNN inspection order number */
-function _newInspectNo(){
-  var t=hkParts();
-  return 'IN-'+t.Y+t.M+t.D+'-'+String(Math.floor(Math.random()*900)+100);
+/* 工單編號:用「而家」香港日期(唔係頁面打開嗰日),並避開已存在/已刪除嘅單號,防止撞號蓋走其他單。
+   Order numbers use the CURRENT HK date (not page-load date) and skip any existing/deleted number, so a new
+   order can never overwrite another order or be mistaken for a deleted one. */
+function newOrderNo(prefix){
+  var t=hkParts(); var base=prefix+'-'+t.Y+t.M+t.D+'-';
+  var used=new Set(); (store.orders||[]).forEach(function(o){ if(o&&o.no) used.add(String(o.no)); });
+  (store.deletedOrders||[]).forEach(function(x){ if(x&&x.no) used.add(String(x.no)); });
+  (store.logs||[]).forEach(function(l){ if(l&&l.target&&String(l.target).indexOf(base)===0) used.add(String(l.target)); });
+  for(var i=0;i<2000;i++){ var n=base+String(Math.floor(Math.random()*900)+100); if(!used.has(n)) return n; }
+  for(var j=0;j<2000;j++){ var n2=base+String(Math.floor(Math.random()*9000)+1000); if(!used.has(n2)) return n2; }
+  return base+String(Date.now()).slice(-6);
 }
+/* 例行檢查工單編號 IN-YYYYMMDD-NNN inspection order number */
+function _newInspectNo(){ return newOrderNo('IN'); }
 /* 是否已有該設備「未完成」的例行檢查工單,避免重複開單。
    Any OPEN inspection order already exists for this machine? avoid duplicates. */
 function _hasOpenInspection(machineId){
@@ -4213,7 +4244,7 @@ function checkDueInspections(){
               if(config.inspectNotifyEmail!==false){
                 var _ic=store.companies.find(function(x){return x.id===m.companyId;});
                 var _ito=(_ic&&_ic.notifyEmail)?_ic.notifyEmail:(config.brandOwnerEmail||config.smtpAlertTo||'');
-                if(_ito){ sendEmail(_ito, '【'+(config.brandName||'Sunshine Laundry Group')+'】定期例行檢查工單 Inspection Order · '+no, buildOrderText(order), 'inspection', no); }
+                if(_ito){ sendEmail(_ito, '【'+(config.brandName||'Sunshine Laundry Group')+'】定期例行檢查工單 Inspection Order · '+order.no, buildOrderText(order), 'inspection', order.no); }
               } else { addLog('notify_skip', no, '例檢 Email 通知已關閉 inspection Email off'); }
             }catch(_){}
           }});
@@ -4441,6 +4472,16 @@ function openPendingOrder(){
     const no=window.__pendingOrderJump; if(!no) return;
     window.__pendingOrderJump=null;
     const o=store.orders.find(x=>x.no===no);
+    if(!o && !window.__pendingCloudTried){
+      // 本機未有:先問伺服器 not local yet -> ask the server first
+      window.__pendingCloudTried=true;
+      fetchOrderFromCloud(no).then(function(d){
+        if(d&&d.found&&d.order){ _injectCloudOrder(d.order); try{ refreshAll(); }catch(_){} window.__pendingOrderJump=no; openPendingOrder(); }
+        else { try{ openModal(d&&d.deleted?'工單已刪除 Order Deleted':'找不到工單 Order Not Found', '<p style="line-height:1.7">'+_orderMissingMsg(no,d)+'</p>'); }catch(_){} }
+        window.__pendingCloudTried=false;
+      });
+      return;
+    }
     if(!o){
       // 找不到就明確提示,不會自動建立新工單。Not found -> clear notice, never auto-create.
       toast('找不到工單 Order not found：'+no);
@@ -4477,6 +4518,28 @@ function _tqError(title, msg){
     +'<p style="font-size:.92rem;line-height:1.6;margin:.4rem 0 1rem">'+msg+'</p>'
     +'<div class="tq-note">如需協助,請聯絡管理員。 If you need help, contact the administrator.</div>';
 }
+// 直接向伺服器查單一工單(手機未載完全部資料都搵到)Ask the server for ONE order (works before the full sync finishes)
+async function fetchOrderFromCloud(no){
+  for(var i=0;i<6;i++){
+    try{ var r=await fetch('/api/orders/'+encodeURIComponent(no),{cache:'no-store'}); if(r.ok){ var d=await r.json(); if(d) return d; } }catch(e){}
+    await new Promise(function(res){ setTimeout(res, 1500*(i+1)); });
+  }
+  return null; // 連唔到伺服器 cannot reach server
+}
+function _injectCloudOrder(o){
+  if(!o||!o.no) return;
+  var i=store.orders.findIndex(function(x){ return x&&x.no===o.no; });
+  if(i<0) store.orders.unshift(o); else if((Number(o._ts)||0)>=(Number(store.orders[i]._ts)||0)) store.orders[i]=o;
+  try{ saveStoreLocalOnly(); }catch(_){}
+}
+function _orderMissingMsg(no, d){
+  if(d && d.deleted){
+    var who=d.deleted.user?(' · '+esc(d.deleted.user)):''; var at=d.deleted.at||(d.deleted.ts?new Date(d.deleted.ts).toLocaleString('zh-HK'):'');
+    return '工單 <b>'+esc(no)+'</b> 已被刪除'+(at?('（'+esc(at)+who+'）'):'')+'。<br>Order <b>'+esc(no)+'</b> was deleted'+(at?(' ('+esc(at)+')'):'')+'.';
+  }
+  if(d===null) return '暫時連唔到伺服器，未能讀取工單 <b>'+esc(no)+'</b>，請稍後重新整理。<br>Cannot reach the server to load order <b>'+esc(no)+'</b>. Please refresh later.';
+  return '雲端沒有工單 <b>'+esc(no)+'</b> 的記錄（亦冇刪除記錄），即係呢張單當時未成功儲存到雲端。請按通知內容重新開單。<br>There is no record of order <b>'+esc(no)+'</b> in the cloud (and no deletion record) — it was never saved. Please re-create it from the notification details.';
+}
 function openTechQuick(no, tok, _retry){
   no=(no||'').trim(); tok=(tok||'').trim();
   _showTechQuickOnly();
@@ -4484,7 +4547,9 @@ function openTechQuick(no, tok, _retry){
   var o=store.orders.find(function(x){return x.no===no;});
   if(!o){
     var n=(_retry||0);
-    if(n<12){ setTimeout(function(){ openTechQuick(no,tok,n+1); }, 500); 
+    if(n===4){ fetchOrderFromCloud(no).then(function(d){ if(d&&d.found&&d.order){ _injectCloudOrder(d.order); } else if(!store.orders.some(function(x){return x.no===no;})){ window.__tqMiss={no:no, d:d}; } }); }
+    if(window.__tqMiss && window.__tqMiss.no===no && n>=6){ var _mm=window.__tqMiss; window.__tqMiss=null; _tqError(_mm.d&&_mm.d.deleted?'工單已刪除 Order deleted':'找不到工單 Order not found', _orderMissingMsg(no,_mm.d)); return; }
+    if(n<40){ setTimeout(function(){ openTechQuick(no,tok,n+1); }, 500); 
       var card=document.getElementById('tqCard'); if(card) card.innerHTML='<div class="tq-head"><div class="logo">🔧</div><div><div class="tq-title">載入中… Loading…</div><div class="tq-sub">正在讀取工單資料 Fetching order</div></div></div>';
       return;
     }
@@ -4644,7 +4709,7 @@ $('#submitOrderBtn').addEventListener('click', () => {
   if(idt && idt<todayStr()){ $('#frontMsg').innerHTML='<span style="color:var(--color-error)">期望安裝新機時間不能早於今天 Expected install date cannot be earlier than today</span>'; return; }
   const urgency = document.querySelector('input[name=urgency]:checked').value;
   const via = $('#contactVia').value;
-  const no = 'SR-'+today.getFullYear()+String(today.getMonth()+1).padStart(2,'0')+String(today.getDate()).padStart(2,'0')+'-'+String(Math.floor(Math.random()*900)+100);
+  const no = newOrderNo('SR');
   const notes='';
   const order={no, kind:'repair', companyId:verifiedMachine.companyId, machineId:verifiedMachine.id, issue, notes, urgency, bookingDate:bd, slot, installDate:idt, manualNo:mno, status:'new', contact:cp, via, value:cv, created:nowStr(), _ts:Date.now()};
   // 電腦設備報修:記錄 IT 資產並交由 IT 維修負責公司處理 IT-equipment repair: link asset, routed to IT handler
@@ -4659,8 +4724,8 @@ $('#submitOrderBtn').addEventListener('click', () => {
   const _fm=$('#frontMsg');
   _fm.innerHTML=`<span style="color:var(--color-text-muted)">⏳ 儲存中… Saving… 工單編號 Order No: <strong>${no}</strong></span>`;
   commitNewOrder(order).then(function(ok){
-    if(ok){ _fm.innerHTML=`<span style="color:var(--color-success)">提交成功 Submission successful · 工單編號 Order No: <strong>${no}</strong><br>下單時間 Order Date/Time: <strong>${order.created}</strong></span>`; }
-    else { _fm.innerHTML=`<span style="color:var(--color-warning,#b45309)">工單編號 Order No: <strong>${no}</strong></span>`+_saveFailHtml(no); }
+    if(ok){ _fm.innerHTML=`<span style="color:var(--color-success)">提交成功 Submission successful · 工單編號 Order No: <strong>${order.no}</strong><br>下單時間 Order Date/Time: <strong>${order.created}</strong></span>`; }
+    else { _fm.innerHTML=`<span style="color:var(--color-warning,#b45309)">工單編號 Order No: <strong>${order.no}</strong></span>`+_saveFailHtml(order.no); }
   });
   if(typeof renderOrders==='function' && session){ renderOrders(); renderDashboard(); }
   toast('提交成功 Submitted: '+no);
@@ -4785,7 +4850,7 @@ $('#inst_submit') && $('#inst_submit').addEventListener('click', ()=>{
   if(!isIT && qW+qD<=0){ msg.innerHTML='<span style="color:var(--color-error)">請至少輸入一種機量（洗衣機或乾衣機）Enter at least one machine quantity</span>'; return; }
   if(idt && idt<todayStr()){ msg.innerHTML='<span style="color:var(--color-error)">安裝日期不能早於今天 Install date cannot be earlier than today</span>'; return; }
   let picked=[]; if($('#inst_pickWH') && $('#inst_pickWH').checked){ picked=Array.from(document.querySelectorAll('.inst-wh-chk:checked')).map(x=>x.value); }
-  const no='NI-'+today.getFullYear()+String(today.getMonth()+1).padStart(2,'0')+String(today.getDate()).padStart(2,'0')+'-'+String(Math.floor(Math.random()*900)+100);
+  const no=newOrderNo('NI');
   // IT 安裝摘要 IT install summary
   const itParts=[];
   if(itPos>0) itParts.push('POS ×'+itPos);
@@ -4806,7 +4871,7 @@ $('#inst_submit') && $('#inst_submit').addEventListener('click', ()=>{
   saveStore();
   msg.innerHTML=`<span style="color:var(--color-text-muted)">⏳ 儲存中… Saving… 工單編號 Order No: <strong>${no}</strong></span>`;
   commitNewOrder(order).then(function(ok){
-    msg.innerHTML = ok ? `<span style="color:var(--color-success)">提交成功 Submitted · 工單編號 Order No: <strong>${no}</strong></span>` : (`<span style="color:var(--color-warning,#b45309)">工單編號 Order No: <strong>${no}</strong></span>`+_saveFailHtml(no));
+    msg.innerHTML = ok ? `<span style="color:var(--color-success)">提交成功 Submitted · 工單編號 Order No: <strong>${order.no}</strong></span>` : (`<span style="color:var(--color-warning,#b45309)">工單編號 Order No: <strong>${order.no}</strong></span>`+_saveFailHtml(order.no));
   });
   if(typeof renderOrders==='function' && session){ renderOrders(); renderDashboard(); }
   toast('新安裝工單已提交 Install order submitted: '+no);
@@ -4822,7 +4887,7 @@ $('#ext_submit') && $('#ext_submit').addEventListener('click', ()=>{
   const urg=(document.querySelector('input[name=extUrgency]:checked')||{}).value||'normal';
   const msg=$('#ext_msg');
   if(!nm||!ph||!ad||!rs){ msg.innerHTML='<span style="color:var(--color-error)">請填寫客戶名稱、電話、地址及原因 Please fill customer name, phone, address & reason</span>'; return; }
-  const no='EX-'+today.getFullYear()+String(today.getMonth()+1).padStart(2,'0')+String(today.getDate()).padStart(2,'0')+'-'+String(Math.floor(Math.random()*900)+100);
+  const no=newOrderNo('EX');
   const order={no, kind:'external', companyId:cid||'', machineId:'', issue:rs, notes:'', urgency:urg, bookingDate:'', slot:'', installDate:'', manualNo:'', status:'new', contact:nm, via:'phone', value:ph, extName:nm, extPhone:ph, extAddress:ad, extReason:rs, created:nowStr(), _ts:Date.now()};
   store.orders.unshift(order);
   addLog('new_order', no, `外客 External / ${nm} / ${ph}`);
@@ -4830,7 +4895,7 @@ $('#ext_submit') && $('#ext_submit').addEventListener('click', ()=>{
   saveStore();
   msg.innerHTML=`<span style="color:var(--color-text-muted)">⏳ 儲存中… Saving… 工單編號 Order No: <strong>${no}</strong></span>`;
   commitNewOrder(order).then(function(ok){
-    msg.innerHTML = ok ? `<span style="color:var(--color-success)">提交成功 Submitted · 工單編號 Order No: <strong>${no}</strong></span>` : (`<span style="color:var(--color-warning,#b45309)">工單編號 Order No: <strong>${no}</strong></span>`+_saveFailHtml(no));
+    msg.innerHTML = ok ? `<span style="color:var(--color-success)">提交成功 Submitted · 工單編號 Order No: <strong>${order.no}</strong></span>` : (`<span style="color:var(--color-warning,#b45309)">工單編號 Order No: <strong>${order.no}</strong></span>`+_saveFailHtml(order.no));
   });
   if(typeof renderOrders==='function' && session){ renderOrders(); renderDashboard(); }
   toast('外客工單已提交 External order submitted: '+no);
@@ -8038,7 +8103,7 @@ async function renderCloudBackups(){
     if(!d||!d.ok){ box.textContent='未能載入備份列表 Failed to load backups'; return; }
     if(!d.backups.length){ box.textContent='暫時未有雲端備份（伺服器啟動後會自動建立第一份）No cloud backups yet (the first one is created automatically).'; return; }
     box.innerHTML='<div class="table-wrap"><table><thead><tr><th>時間 Time</th><th>類型 Type</th><th>內容 Contents</th><th></th></tr></thead><tbody>'+
-      d.backups.map(b=>'<tr><td>'+esc(_bkTime(b.created_at))+'</td><td>'+(b.reason==='manual'?'手動 Manual':'自動 Auto')+'</td><td>'+b.counts.companies+' 公司 / '+b.counts.machines+' 設備 / '+b.counts.orders+' 工單 / '+b.counts.users+' 使用者</td><td><button class="btn btn-secondary btn-sm" data-cloudbk="'+b.id+'">下載 Download</button></td></tr>').join('')+
+      d.backups.map(b=>'<tr><td>'+esc(_bkTime(b.created_at))+'</td><td>'+(b.reason==='manual'?'手動 Manual':(b.reason==='before_restore'?'還原前 Before restore':'自動 Auto'))+'</td><td>'+b.counts.companies+' 公司 / '+b.counts.machines+' 設備 / '+b.counts.orders+' 工單 / '+b.counts.users+' 使用者</td><td><button class="btn btn-secondary btn-sm" data-cloudbk="'+b.id+'">下載 Download</button></td></tr>').join('')+
       '</tbody></table></div>';
   }catch(e){ box.textContent='未能連線伺服器 Cannot reach server'; }
 }
@@ -8937,7 +9002,9 @@ setTimeout(hideBootOverlay, 3500);
       (store.orders||[]).forEach(function(o){
         if(!o||!o.no||_cNos.has(o.no)||_del.has(String(o.no))) return;
         if(_ob.has(o.no)){ _rescue.push(o); return; }
-        var legacy = ['repair','install','external'].indexOf(o.kind||'repair')>=0 && String(o.created||'')>=_since && !!o._ts
+        var _unfinished = o.status!=='completed' && o.status!=='cancelled';
+        var _d30=new Date(Date.now()-30*86400000); var _since30=_d30.getFullYear()+'-'+String(_d30.getMonth()+1).padStart(2,'0')+'-'+String(_d30.getDate()).padStart(2,'0');
+        var legacy = ['repair','install','external'].indexOf(o.kind||'repair')>=0 && (String(o.created||'')>=_since || (_unfinished && String(o.created||'')>=_since30)) && !!o._ts
           && (o.machineId ? _cm.get(o.machineId)===o.companyId : _cc.has(o.companyId));
         if(legacy){ _rescue.push(o); _outboxAdd({no:o.no, notify:false, inspection:false, at:Date.now(), rescued:true}); } // 舊單已發過通知,唔再發 already notified before
       });

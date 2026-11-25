@@ -111,6 +111,28 @@ function _deletedSet(inner){
   _arr(inner && inner.logs).forEach(l => { if (l && l.action === 'delete_order' && l.target) { const k = String(l.target); if (!m.has(k)) m.set(k, 0); } });
   return m;
 }
+// 舊版刪除日誌時間(香港時間字串)→ 毫秒 legacy delete-log time (HK string) -> ms
+function _hkTsMs(s) { const t = Date.parse(String(s || '').replace(' ', 'T') + (String(s || '').length <= 16 ? ':00' : '') + '+08:00'); return isNaN(t) ? 0 : t; }
+// 刪除時間:tombstone 或刪除日誌(取最新)deletion time from tombstone or delete log (latest)
+function _deletedAt(inner, k) {
+  let ts = -1;
+  _arr(inner && inner.deletedOrders).forEach(t => { if (t && String(t.no) === k) ts = Math.max(ts, Number(t.ts) || 0); });
+  _arr(inner && inner.logs).forEach(l => { if (l && l.action === 'delete_order' && String(l.target) === k) ts = Math.max(ts, _hkTsMs(l.ts)); });
+  return ts; // -1 = 從未刪除 never deleted
+}
+// 兩張係咪唔同嘅單(撞號)whether two records with the same no are actually different orders (number clash)
+function _distinctOrder(a, b) {
+  if (!a || !b) return false;
+  return String(a.created || '') !== String(b.created || '') || String(a.machineId || '') !== String(b.machineId || '') || String(a.kind || 'repair') !== String(b.kind || 'repair');
+}
+function _hkDate() { const d = new Date(Date.now() + 8 * 3600 * 1000); return d.toISOString().slice(0, 10).replace(/-/g, ''); }
+function _freshNo(inner, no) {
+  const pre = (String(no).match(/^([A-Z]+)-/) || [null, 'SR'])[1] + '-' + _hkDate() + '-';
+  const used = new Set(); _arr(inner.orders).forEach(o => o && used.add(String(o.no)));
+  _arr(inner.deletedOrders).forEach(t => t && used.add(String(t.no))); _arr(inner.logs).forEach(l => l && l.target && used.add(String(l.target)));
+  for (let i = 0; i < 3000; i++) { const n = pre + String(Math.floor(Math.random() * (i < 1500 ? 900 : 9000)) + (i < 1500 ? 100 : 1000)); if (!used.has(n)) return n; }
+  return pre + String(Date.now()).slice(-6);
+}
 function mergeInner(dbInner, inInner) {
   dbInner = dbInner || {}; inInner = inInner || {};
   const out = Object.assign({}, dbInner, inInner); // 其他資料:以送來嘅為準 other arrays: incoming wins (unchanged behaviour)
@@ -133,9 +155,16 @@ function mergeInner(dbInner, inInner) {
     if (!o || !o.no) return; const k = String(o.no); inKeys.add(k);
     const cur = map.get(k);
     if (!cur) {
-      // 已刪除嘅舊單唔好被舊裝置「復活」 don't let a stale device resurrect a deleted order
-      if (legacyDel.has(k) && (Number(o._ts) || 0) <= (tmap.has(k) ? tmap.get(k).ts : Infinity)) { merged = true; return; }
+      // 已刪除嘅舊單唔好被舊裝置「復活」;但刪除之後先開嘅新單(撞號)照樣保留
+      // don't resurrect a deleted order, but KEEP a newer order that merely reuses the number
+      if (legacyDel.has(k)) { const da = Math.max(_deletedAt(dbInner, k), _deletedAt(inInner, k)); if ((Number(o._ts) || 0) <= da) { merged = true; return; } }
       map.set(k, o);
+    } else if (_distinctOrder(cur, o)) {
+      // 撞號:兩張都保留,送來嗰張用後備單號 number clash: keep BOTH; the incoming one gets a stable alternate number
+      const alt = k + '-' + String(Math.abs([...String(o.created || '') + String(o.machineId || '')].reduce((a, c) => ((a << 5) - a + c.charCodeAt(0)) | 0, 7)) % 1000).padStart(3, '0');
+      const ex = map.get(alt);
+      if (!ex || (Number(o._ts) || 0) >= (Number(ex._ts) || 0)) map.set(alt, Object.assign({}, o, { no: alt, _clashOf: k }));
+      merged = true;
     } else if ((Number(o._ts) || 0) >= (Number(cur._ts) || 0)) { map.set(k, o); }
     else merged = true;
   });
@@ -173,12 +202,31 @@ function mergeStoreObj(dbStore, inStore) {
   return { store: { seq, store: r.inner }, merged: r.merged };
 }
 
+// 前端版本號(用嚟提示舊頁面自動重新載入)Frontend version, so stale open pages can auto-reload
+let APP_VERSION_SERVED = null;
+try { const _m = require('fs').readFileSync(path.join(__dirname, 'public', 'index.html'), 'utf8').match(/const APP_VERSION\s*=\s*'([^']+)'/); if (_m) APP_VERSION_SERVED = _m[1]; } catch (e) {}
 // ---- 輕量版本號 Lightweight version check (poll without downloading everything) ----
 app.get('/api/version', async (req, res) => {
   try {
     const r = await pool.query('SELECT updated_at FROM app_state WHERE workspace = $1', [wsKey(req)]);
     res.set('Cache-Control', 'no-store');
-    res.json({ found: r.rows.length > 0, updated_at: r.rows.length ? r.rows[0].updated_at : null });
+    res.json({ found: r.rows.length > 0, updated_at: r.rows.length ? r.rows[0].updated_at : null, appVersion: APP_VERSION_SERVED });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// ---- 查詢單一工單 Look up ONE order (repair-station links; no full download) ----
+app.get('/api/orders/:no', async (req, res) => {
+  try {
+    const r = await pool.query('SELECT store FROM app_state WHERE workspace = $1', [wsKey(req)]);
+    res.set('Cache-Control', 'no-store');
+    if (!r.rows.length) return res.json({ found: false });
+    const inner = (r.rows[0].store && r.rows[0].store.store) || {};
+    const k = String(req.params.no || '').trim();
+    const o = _arr(inner.orders).find(x => x && String(x.no) === k);
+    if (o) return res.json({ found: true, order: o });
+    const tomb = _arr(inner.deletedOrders).find(t => t && String(t.no) === k);
+    const dlog = _arr(inner.logs).find(l => l && l.action === 'delete_order' && String(l.target) === k);
+    res.json({ found: false, deleted: (tomb || dlog) ? { ts: tomb ? tomb.ts : null, at: dlog ? dlog.ts : null, user: dlog ? dlog.user : null } : null });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
@@ -202,12 +250,31 @@ app.post('/api/orders', async (req, res) => {
       const dup = orders.find(o => o && o.kind === 'inspection' && o.machineId === order.machineId && o.status !== 'completed' && o.status !== 'cancelled');
       if (dup) { await client.query('ROLLBACK'); return res.json({ ok: true, duplicate: true, existing: dup.no }); }
     }
-    let existed = idx >= 0;
-    if (existed) { if ((Number(order._ts) || 0) >= (Number(orders[idx]._ts) || 0)) orders[idx] = order; }
+    const delAt = _deletedAt(inner, k);
+    const clash = (idx >= 0 && _distinctOrder(orders[idx], order)) || (idx < 0 && delAt >= 0);
+    let renamed = null;
+    // 之前已經改過號(回應遺失後重試)previously renamed (retry after a lost response) -> reuse that record
+    const prev = clash ? orders.find(o => o && o._renamedFrom === k && !_distinctOrder(o, order)) : null;
+    if (prev) { order.no = prev.no; order._renamedFrom = k; }
+    if (prev) { /* fallthrough: treat as existing */ }
+    else if (clash && (req.body.isNew || idx >= 0)) {
+      // 撞號(已有另一張單,或者呢個單號曾經刪除):改用新單號,兩張都保留
+      // number clash (another order has it, or it was deleted before): assign a fresh number, keep both
+      renamed = _freshNo(inner, k);
+      order.no = renamed; order._renamedFrom = k;
+      if (log && log.target === k) log.target = renamed;
+      if (notification && notification.orderNo === k) { notification.orderNo = renamed; if (typeof notification.text === 'string') notification.text = notification.text.split(k).join(renamed); }
+    } else if (idx < 0 && delAt >= 0 && (Number(order._ts) || 0) <= delAt) {
+      // 補回嘅舊副本,但已被手動刪除 a rescued old copy of a manually deleted order
+      await client.query('ROLLBACK'); return res.json({ ok: true, deleted: true });
+    }
+    const k2 = String(order.no);
+    const idx2 = renamed ? -1 : (prev ? orders.indexOf(prev) : idx);
+    if (prev) renamed = prev.no;
+    let existed = idx2 >= 0;
+    if (existed) { if ((Number(order._ts) || 0) >= (Number(orders[idx2]._ts) || 0)) orders[idx2] = order; }
     else orders.unshift(order);
     inner.orders = orders;
-    // 移除同單號嘅刪除記錄(如果係新建)clear a tombstone with the same no for a brand-new order
-    if (!existed) inner.deletedOrders = _arr(inner.deletedOrders).filter(t => !t || String(t.no) !== k);
     if (log && log.ts) {
       const lk = x => ((x && x.ts) || '') + '|' + ((x && x.action) || '') + '|' + ((x && x.target) || '');
       const logs = _arr(inner.logs); if (!logs.some(x => lk(x) === lk(log))) inner.logs = [log].concat(logs).slice(0, 1000);
@@ -218,7 +285,7 @@ app.post('/api/orders', async (req, res) => {
     const newStore = Object.assign({}, st, { store: inner });
     const w = await client.query('UPDATE app_state SET store = $2::jsonb, updated_at = now() WHERE workspace = $1 RETURNING updated_at', [ws, JSON.stringify(newStore)]);
     await client.query('COMMIT');
-    res.json({ ok: true, existed, updated_at: w.rows[0].updated_at });
+    res.json({ ok: true, existed, renamed, no: String(order.no), updated_at: w.rows[0].updated_at });
   } catch (e) {
     try { await client.query('ROLLBACK'); } catch (_) {}
     console.error('[POST /api/orders]', e);
@@ -246,6 +313,17 @@ app.put('/api/state', async (req, res) => {
         const cur = await client.query('SELECT store FROM app_state WHERE workspace = $1 FOR UPDATE', [ws]);
         if (cur.rows.length && cur.rows[0].store && cur.rows[0].store.store) {
           const m = mergeStoreObj(cur.rows[0].store, store); store = m.store; merged = m.merged;
+        }
+      } else if (store !== undefined && replace) {
+        // 還原備份:先自動備份一次;未完成而備份入面冇嘅工單照樣保留,唔會被還原刪走
+        // Restore: snapshot first; unfinished orders missing from the backup are KEPT (never removed by a restore)
+        const cur = await client.query('SELECT store FROM app_state WHERE workspace = $1 FOR UPDATE', [ws]);
+        if (cur.rows.length && cur.rows[0].store && cur.rows[0].store.store) {
+          await client.query(`INSERT INTO app_backups (workspace, reason, config, store) SELECT workspace, 'before_restore', config, store FROM app_state WHERE workspace = $1`, [ws]);
+          const inInner = (store && store.store) || {};
+          const have = new Set(_arr(inInner.orders).map(o => o && String(o.no)));
+          const keep = _arr(cur.rows[0].store.store.orders).filter(o => o && o.no && !have.has(String(o.no)) && o.status !== 'completed' && o.status !== 'cancelled');
+          if (keep.length) { store = Object.assign({}, store, { store: Object.assign({}, inInner, { orders: keep.concat(_arr(inInner.orders)) }) }); merged = true; }
         }
       }
     r = await client.query(
