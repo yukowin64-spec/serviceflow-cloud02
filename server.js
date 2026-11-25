@@ -9,6 +9,7 @@
  *  - PUT  /api/state    儲存整包雲端資料(伺服器合併,防止互相覆蓋)Save full cloud state (server-side merge)
  *  - GET  /api/version  輕量版本號 Lightweight version check
  *  - POST /api/orders   即時儲存單一新工單 Save one new order atomically
+ *  - GET/POST /api/backups, GET /api/backups/:id  雲端自動備份(每12小時,保留7日)Auto backups (12h, keep 7 days)
  *  - POST /api/send-email  透過 SMTP 發郵件  Send email via SMTP
  *  - 伺服器端每日排程(24小時自動運行,無需任何人登入)
  *    Server-side daily scheduler (runs 24/7, no login required)
@@ -52,7 +53,18 @@ async function initDb() {
       updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
-  console.log('[db] app_state 表已就緒 table ready');
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS app_backups (
+      id          SERIAL PRIMARY KEY,
+      workspace   TEXT NOT NULL,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+      reason      TEXT NOT NULL DEFAULT 'auto',
+      config      JSONB NOT NULL DEFAULT '{}'::jsonb,
+      store       JSONB NOT NULL DEFAULT '{}'::jsonb
+    );
+  `);
+  await pool.query('CREATE INDEX IF NOT EXISTS app_backups_ws_time ON app_backups (workspace, created_at DESC)');
+  console.log('[db] app_state / app_backups 表已就緒 tables ready');
 }
 
 // 預設 workspace(單一團隊共用一份資料)。將來要多團隊可用 ?ws= 分開。
@@ -554,6 +566,81 @@ function startScheduler() {
   console.log('[scheduler] 伺服器每日排程已啟動(每分鐘檢查一次,按系統設定時間發送) server-side daily scheduler started (checks every minute, fires at config.digestHour HK)');
 }
 
+// ================= 自動備份 Auto backup (v2.0.0) =================
+// 每 12 小時喺資料庫存一份完整快照,保留 7 日(約 14 份)。
+// Every 12 hours store a full snapshot in the DB; keep 7 days (~14 copies).
+const BACKUP_EVERY_MS = 12 * 3600 * 1000;
+const BACKUP_KEEP_DAYS = 7;
+function _bkCounts(store) {
+  const s = (store && store.store) || {};
+  return { companies: _arr(s.companies).length, machines: _arr(s.machines).length, orders: _arr(s.orders).length, users: _arr(s.users).length };
+}
+async function createBackup(ws, reason) {
+  const r = await pool.query(
+    `INSERT INTO app_backups (workspace, reason, config, store)
+     SELECT workspace, $2, config, store FROM app_state WHERE workspace = $1
+     RETURNING id, created_at`, [ws, reason || 'auto']);
+  return r.rows[0] || null;
+}
+async function pruneBackups() {
+  await pool.query(`DELETE FROM app_backups WHERE created_at < now() - ($1 || ' days')::interval`, [String(BACKUP_KEEP_DAYS)]);
+}
+let _backupBusy = false;
+async function backupTick() {
+  if (_backupBusy) return; _backupBusy = true;
+  try {
+    const r = await pool.query('SELECT workspace FROM app_state');
+    for (const row of r.rows) {
+      const last = await pool.query(`SELECT created_at FROM app_backups WHERE workspace = $1 AND reason = 'auto' ORDER BY created_at DESC LIMIT 1`, [row.workspace]);
+      const lastT = last.rows.length ? new Date(last.rows[0].created_at).getTime() : 0;
+      if (Date.now() - lastT >= BACKUP_EVERY_MS - 60 * 1000) {
+        const b = await createBackup(row.workspace, 'auto');
+        if (b) console.log('[backup] ✅ 自動備份完成 auto backup #' + b.id + ' · ws=' + row.workspace);
+      }
+    }
+    await pruneBackups();
+  } catch (e) {
+    console.warn('[backup] 失敗 failed:', String(e.message || e));
+  } finally { _backupBusy = false; }
+}
+function startBackupScheduler() {
+  setTimeout(backupTick, 20 * 1000);          // 啟動後檢查一次 check shortly after boot
+  setInterval(backupTick, 10 * 60 * 1000);    // 之後每 10 分鐘檢查係咪夠 12 小時 then every 10 min
+  console.log('[backup] 自動備份已啟動:每 12 小時一次,保留 7 日 auto backup: every 12h, keep 7 days');
+}
+// 列出備份 List backups (no payload)
+app.get('/api/backups', async (req, res) => {
+  try {
+    const ws = wsKey(req);
+    const r = await pool.query(`SELECT id, created_at, reason, store FROM app_backups WHERE workspace = $1 ORDER BY created_at DESC LIMIT 50`, [ws]);
+    res.json({ ok: true, everyHours: 12, keepDays: BACKUP_KEEP_DAYS,
+      backups: r.rows.map(x => ({ id: x.id, created_at: x.created_at, reason: x.reason, counts: _bkCounts(x.store) })) });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e.message || e) }); }
+});
+// 立即備份 Backup now
+app.post('/api/backups', async (req, res) => {
+  try {
+    const b = await createBackup(wsKey(req), 'manual');
+    if (!b) return res.status(409).json({ ok: false, error: 'no state' });
+    await pruneBackups();
+    res.json({ ok: true, id: b.id, created_at: b.created_at });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e.message || e) }); }
+});
+// 下載備份(同「匯出備份」格式,可直接用「匯入備份」還原)Download in the same format as Export Backup
+app.get('/api/backups/:id', async (req, res) => {
+  try {
+    const r = await pool.query('SELECT id, created_at, reason, config, store FROM app_backups WHERE id = $1 AND workspace = $2', [Number(req.params.id) || 0, wsKey(req)]);
+    if (!r.rows.length) return res.status(404).json({ ok: false, error: 'not found' });
+    const x = r.rows[0]; const st = x.store || {};
+    const hk = new Date(new Date(x.created_at).getTime() + 8 * 3600 * 1000).toISOString().slice(0, 19);
+    const body = { _type: 'sunshine_laundry_backup', _version: 1, _exportedAt: hk.replace('T', ' '),
+      _exportedBy: (x.reason === 'manual' ? '雲端手動備份 cloud manual backup' : '雲端自動備份 cloud auto backup') + ' #' + x.id,
+      seq: st.seq || {}, config: x.config || {}, store: st.store || {} };
+    res.setHeader('Content-Disposition', 'attachment; filename="sunshine_cloud_backup_' + hk.replace(/[:T]/g, '-') + '.json"');
+    res.json(body);
+  } catch (e) { res.status(500).json({ ok: false, error: String(e.message || e) }); }
+});
+
 // ---- 前端 fallback(SPA):其他路徑派 index.html ----
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
@@ -564,6 +651,7 @@ initDb()
   .then(() => {
     app.listen(PORT, () => console.log(`[server] ServiceFlow Cloud 運行中 running on :${PORT}`));
     startScheduler();
+    startBackupScheduler();
   })
   .catch((e) => {
     console.error('[fatal] 資料庫初始化失敗 DB init failed:', e);

@@ -764,9 +764,16 @@
             <button class="btn btn-primary" id="set_backupExport">匯出備份 Export Backup</button>
             <label class="btn btn-secondary" for="set_backupFile" style="cursor:pointer">匯入備份 Import Backup</label>
             <input type="file" id="set_backupFile" accept=".json,application/json" style="display:none">
-            <button class="btn btn-secondary" id="set_backupReset">重設為預設資料 Reset to Demo</button>
           </div>
           <div id="set_backupMsg" class="small" style="margin-top:.75rem"></div>
+          <div style="margin-top:1.1rem;padding-top:1rem;border-top:1px solid var(--color-border,#e5e7eb)">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:.6rem;flex-wrap:wrap">
+              <h4 style="margin:0">☁️ 雲端自動備份 Cloud Auto Backups</h4>
+              <div class="btn-row" style="margin:0"><button class="btn btn-secondary btn-sm" id="set_cloudBkNow">立即備份 Backup Now</button><button class="btn btn-secondary btn-sm" id="set_cloudBkRefresh">重新整理 Refresh</button></div>
+            </div>
+            <p class="small" style="margin:.3rem 0 .6rem;opacity:.8">伺服器每 12 小時自動備份一次，保留 7 日。下載後可用「匯入備份」還原。The server backs up automatically every 12 hours and keeps 7 days. Download a copy and use "Import Backup" to restore.</p>
+            <div id="set_cloudBkList" class="small">載入中… Loading…</div>
+          </div>
           <div class="notice" style="margin-top:1rem">✅ 本裝置的所有資料變動會自動保存，重新整理頁面或登出後仍會保留。備份檔為 JSON 格式，可離線保存；匯入還原前會先要求確認。<br>All data changes on this device are saved automatically and persist after reload or logout. The backup file (JSON) can be stored offline; you will be asked to confirm before a restore replaces existing data.</div>
         </article>
 
@@ -3388,7 +3395,7 @@ let uidSeq = 100, cidSeq = 100;
 
 /* ================= APP VERSION ================= */
 /* 系統版本號 App version — 顯示於首頁與登入頁頁尾 shown in front/login page footer */
-const APP_VERSION = 'v1.9.9';
+const APP_VERSION = 'v2.0.0';
 const APP_BUILD = '2026-11-10';
 function applyAppVersion(){
   try{
@@ -5215,7 +5222,7 @@ function notifyNewOrderEmail(o){
     '',
     '— '+bn+' 自動報單系統 Auto Order System'
   ].filter(function(x){return x!=='';});
-  const subject='【'+bn+'自動報單系統】新'+kindZh+' · '+o.no+' · '+coName;
+  const subject='【'+_bnSys(bn)+'】新'+kindZh+' · '+o.no+' · '+coName;
   let _body=''; try{ _body=buildOrderText(o); }catch(_){ _body=''; } if(!_body) _body=lines.join('\n'); // 與 Telegram 同一格式 same format as Telegram
   try{ sendEmail(to, subject, _body, 'new_order', o.no); }catch(_){}
 }
@@ -5303,6 +5310,7 @@ function switchSection(id){
   $$('[data-target]').forEach(b=>b.classList.toggle('active', b.dataset.target===id));
   const n = NAV.find(x=>x.id===id);
   if(n){ $('#pageTitle').textContent=n.label; $('#pageDesc').textContent=n.desc; }
+  if(id==='settings'){ try{ renderCloudBackups(); }catch(e){} }
   if(id==='settings') fillSettingsForm(); // refresh SMTP/SMS/digest fields + roles editor with current session
   if(id==='itassets'){ try{ renderItAssets(); }catch(e){} }
 }
@@ -8019,15 +8027,41 @@ function importBackupFile(file){
 }
 document.addEventListener('click',e=>{ if(e.target&&e.target.id==='set_backupExport'){ exportBackup(); } });
 document.addEventListener('change',e=>{ if(e.target&&e.target.id==='set_backupFile'){ const f=e.target.files&&e.target.files[0]; if(f){ importBackupFile(f); } e.target.value=''; } });
-function resetToDemo(){
-  if(!isAdmin()){ toast('只限管理員 Admin only'); return; }
-  openModal('重設為預設資料 Reset to Demo',
-    '<p style="margin:.2rem 0 .8rem;line-height:1.6">這會清除本裝置已保存的所有資料，<b style="color:var(--color-danger,#c0392b)">並回復為系統預設示範資料</b>。建議先匯出備份。This clears all saved data on this device and restores the default demo data. Export a backup first.</p>'+
-    '<div class="btn-row"><button class="btn btn-danger" id="rd_yes">確認重設 Confirm Reset</button><button class="btn btn-secondary" id="rd_no">取消 Cancel</button></div>');
-  $('#rd_yes').addEventListener('click',()=>{ try{ safeStore.removeItem('vf_store'); }catch(e){} closeModal(); toast('已重設，重新載入中 Reset, reloading'); setTimeout(()=>{ location.reload(); }, 600); });
-  $('#rd_no').addEventListener('click',closeModal);
+// 「重設為預設資料」已移除,防止誤按清除資料。"Reset to Demo" removed to prevent accidental data loss.
+// 雲端自動備份列表 Cloud auto-backup list
+function _bkTime(t){ try{ const d=new Date(t); const p=n=>String(n).padStart(2,'0'); return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes()); }catch(_){ return String(t||''); } }
+async function renderCloudBackups(){
+  const box=document.getElementById('set_cloudBkList'); if(!box) return;
+  if(!isAdmin()){ box.textContent='只限管理員 Admin only'; return; }
+  try{
+    const r=await fetch('/api/backups',{cache:'no-store'}); const d=await r.json();
+    if(!d||!d.ok){ box.textContent='未能載入備份列表 Failed to load backups'; return; }
+    if(!d.backups.length){ box.textContent='暫時未有雲端備份（伺服器啟動後會自動建立第一份）No cloud backups yet (the first one is created automatically).'; return; }
+    box.innerHTML='<div class="table-wrap"><table><thead><tr><th>時間 Time</th><th>類型 Type</th><th>內容 Contents</th><th></th></tr></thead><tbody>'+
+      d.backups.map(b=>'<tr><td>'+esc(_bkTime(b.created_at))+'</td><td>'+(b.reason==='manual'?'手動 Manual':'自動 Auto')+'</td><td>'+b.counts.companies+' 公司 / '+b.counts.machines+' 設備 / '+b.counts.orders+' 工單 / '+b.counts.users+' 使用者</td><td><button class="btn btn-secondary btn-sm" data-cloudbk="'+b.id+'">下載 Download</button></td></tr>').join('')+
+      '</tbody></table></div>';
+  }catch(e){ box.textContent='未能連線伺服器 Cannot reach server'; }
 }
-document.addEventListener('click',e=>{ if(e.target&&e.target.id==='set_backupReset'){ resetToDemo(); } });
+async function downloadCloudBackup(id){
+  if(!isAdmin()){ toast('只限管理員 Admin only'); return; }
+  try{
+    const r=await fetch('/api/backups/'+encodeURIComponent(id),{cache:'no-store'}); if(!r.ok) throw new Error('HTTP '+r.status);
+    const txt=JSON.stringify(await r.json(),null,2);
+    const cd=r.headers.get('Content-Disposition')||''; const mm=cd.match(/filename="([^"]+)"/);
+    const blob=new Blob([txt],{type:'application/json;charset=utf-8;'}); const url=URL.createObjectURL(blob), a=document.createElement('a');
+    a.href=url; a.download=(mm?mm[1]:('sunshine_cloud_backup_'+id+'.json')); document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    addLog('settings','下載雲端備份 Download cloud backup', '#'+id); toast('已下載備份 Backup downloaded');
+  }catch(e){ toast('下載失敗 Download failed'); }
+}
+async function cloudBackupNow(){
+  if(!isAdmin()){ toast('只限管理員 Admin only'); return; }
+  try{ const r=await fetch('/api/backups',{method:'POST'}); const d=await r.json(); if(d&&d.ok){ addLog('settings','立即雲端備份 Cloud backup now', '#'+d.id); toast('已建立雲端備份 Cloud backup created'); renderCloudBackups(); } else toast('備份失敗 Backup failed'); }catch(e){ toast('備份失敗 Backup failed'); }
+}
+document.addEventListener('click',e=>{ const t=e.target; if(!t) return;
+  if(t.id==='set_cloudBkNow') cloudBackupNow();
+  else if(t.id==='set_cloudBkRefresh') renderCloudBackups();
+  else if(t.dataset&&t.dataset.cloudbk) downloadCloudBackup(t.dataset.cloudbk);
+});
 
 /* ================= n8n WEBHOOK (Telegram / WhatsApp) ================= */
 function buildN8nPayload(order){
@@ -8126,6 +8160,8 @@ function _itAssetDisp(o){
   return '💻 '+(a.name||'')+' · '+itAssetTypeLabel(a.type)+(w.company&&w.company!=='—'?(' · 品牌 Brand '+w.company):'')+(a.sn?(' · SN '+a.sn):'')+((a.brand||a.model)?(' · '+((a.brand||'')+' '+(a.model||'')).trim()):'')+(w.branch?(' · 門店 '+w.branch):'');
 }
 // 預設 TEXT 內文(與系統郵件一致 + 師父維修工單站連結)。Default TEXT (matches system email + repair-station link).
+// 品牌名已含「自動報單系統」就唔再重複加 avoid doubling the suffix
+function _bnSys(bn){ bn=String(bn||''); return bn.indexOf('自動報單系統')>=0 ? bn : (bn+'自動報單系統'); }
 function buildOrderText(order){
   var c=store.companies.find(function(x){return x.id===order.companyId;});
   var m=store.machines.find(function(x){return x.id===order.machineId;});
@@ -8169,7 +8205,7 @@ function buildOrderText(order){
     nav:(_addr&&_addr!=='-'?navUrl(_addr):''),
     door:_door
   };
-  var def='🔔 【'+bn+'自動報單系統】新工單 New Service Order · '+vals.no+'\n\n'+
+  var def='🔔 【'+_bnSys(bn)+'】新工單 New Service Order · '+vals.no+'\n\n'+
     '👉 師父維修工單站 Repair Station（點入直接更改工單 tap to open & update）：\n'+vals.link+'\n\n'+
     '負責人您好 Dear Owner，\n\n'+
     '收到一張新的工單，詳情如下：\nA new service order has been created:\n'+
