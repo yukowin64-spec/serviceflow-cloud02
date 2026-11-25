@@ -3395,7 +3395,7 @@ let uidSeq = 100, cidSeq = 100;
 
 /* ================= APP VERSION ================= */
 /* 系統版本號 App version — 顯示於首頁與登入頁頁尾 shown in front/login page footer */
-const APP_VERSION = 'v2.0.1';
+const APP_VERSION = 'v2.0.2';
 const APP_BUILD = '2026-11-10';
 function applyAppVersion(){
   try{
@@ -4538,7 +4538,7 @@ function _orderMissingMsg(no, d){
     return '工單 <b>'+esc(no)+'</b> 已被刪除'+(at?('（'+esc(at)+who+'）'):'')+'。<br>Order <b>'+esc(no)+'</b> was deleted'+(at?(' ('+esc(at)+')'):'')+'.';
   }
   if(d===null) return '暫時連唔到伺服器，未能讀取工單 <b>'+esc(no)+'</b>，請稍後重新整理。<br>Cannot reach the server to load order <b>'+esc(no)+'</b>. Please refresh later.';
-  return '雲端沒有工單 <b>'+esc(no)+'</b> 的記錄（亦冇刪除記錄），即係呢張單當時未成功儲存到雲端。請按通知內容重新開單。<br>There is no record of order <b>'+esc(no)+'</b> in the cloud (and no deletion record) — it was never saved. Please re-create it from the notification details.';
+  return '雲端沒有工單 <b>'+esc(no)+'</b> 的記錄，亦沒有任何刪除記錄。即是這張單當時未能成功儲存到雲端（並非被刪除）。請按通知內容重新開單。<br>There is no record of order <b>'+esc(no)+'</b> in the cloud (and no deletion record) — it was never saved. Please re-create it from the notification details.';
 }
 function openTechQuick(no, tok, _retry){
   no=(no||'').trim(); tok=(tok||'').trim();
