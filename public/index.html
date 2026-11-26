@@ -3395,7 +3395,7 @@ let uidSeq = 100, cidSeq = 100;
 
 /* ================= APP VERSION ================= */
 /* 系統版本號 App version — 顯示於首頁與登入頁頁尾 shown in front/login page footer */
-const APP_VERSION = 'v2.0.3';
+const APP_VERSION = 'v2.0.4';
 const APP_BUILD = '2026-11-10';
 function applyAppVersion(){
   try{
@@ -3898,7 +3898,7 @@ function attachDatePicker(input, opts){
 }
 // 更新日曆最小日期 Update a picker's min date
 function setPickerMin(input, minStr){ if(input){ input.__dpxMin=minStr; if(input.value && input.value<minStr){ input.value=''; } } }
-// ===== 免登入工單連結 token (帶 48 小時時效) No-login order link token (48h expiry) =====
+// ===== 免登入工單連結 token(v2.0.4:冇時限,工單完成前有效)No-login order link token (no expiry; valid until completed) =====
 function _shash(s){ var h=5381; for(var i=0;i<s.length;i++){ h=((h*33)^s.charCodeAt(i))>>>0; } return h.toString(36); }
 function ensureStationSecret(){ if(!config.stationSecret){ config.stationSecret=(_shash(String(Date.now())+Math.random())+_shash(String(Math.random()))).slice(0,20); try{ saveConfig(); }catch(e){ try{ saveConfigLocalOnly&&saveConfigLocalOnly(); }catch(_){} } } return config.stationSecret; }
 // 產生一個在 N 小時內有效的 token generate a token valid for N hours from now
@@ -3909,12 +3909,11 @@ function makeStationToken(no){
   var sig=_shash(sec+'|'+no+'|'+expH);
   return expH.toString(36)+'.'+sig;
 }
-// 驗證 token：未過期且簽章正確 validate: not expired AND signature matches
+// 驗證 token：只檢查簽章(v2.0.4 起冇時限,工單完成前一直有效)validate signature only (v2.0.4: no time limit; valid until the order is completed)
 function verifyStationToken(no, tok){
   if(!tok || tok.indexOf('.')<0) return false;
   var sec=config.stationSecret||''; if(!sec) return false;
   var parts=tok.split('.'); var expH=parseInt(parts[0],36); if(!expH) return false;
-  if(expH*3600000 < Date.now()) return false; // 已過期 expired
   return _shash(sec+'|'+no+'|'+expH)===parts[1];
 }
 /* ===== WAREHOUSE + NOTIFICATION HELPERS (feature: 倉庫下拉 + 師父完成通知) ===== */
@@ -4558,7 +4557,13 @@ function openTechQuick(no, tok, _retry){
   }
   // 驗證 token(未過期 + 簽章正確)。verify token (not expired + valid signature)
   if(!verifyStationToken(no, tok)){
-    _tqError('連結已失效 Link expired', '此免登入連結已過期或無效(有效期 '+(Number(config.stationTokenHours)||48)+' 小時)。<br>This no-login link has expired or is invalid (valid for '+(Number(config.stationTokenHours)||48)+'h). 請通知管理員重新發送工單通知。 Please ask the admin to resend the order notification.');
+    _tqError('連結無效 Invalid link', '此免登入連結無效(連結不完整或已被修改)。<br>This no-login link is invalid (incomplete or altered). 請通知管理員重新發送工單通知。 Please ask the admin to resend the order notification.');
+    return;
+  }
+  // 工單已完成 / 已取消:連結完成任務,唔再可以修改 order finished: the link has done its job, no more edits
+  if(o.status==='completed' || o.status==='cancelled'){
+    var _done=o.status==='completed';
+    _tqError(_done?'工單已完成 Order completed':'工單已取消 Order cancelled', '工單 <b>'+esc(o.no)+'</b> '+(_done?'已完成':'已取消')+(o.completedAt?('（'+esc(o.completedAt)+'）'):'')+',此免登入連結已完成任務,不能再修改。<br>Order <b>'+esc(o.no)+'</b> has been '+(_done?'completed':'cancelled')+', so this no-login link can no longer edit it. 如需更改請聯絡管理員。 Please contact the admin for changes.');
     return;
   }
   renderTechQuick(o);
@@ -4602,7 +4607,7 @@ function renderTechQuick(o){
     +'<div class="tq-sect">③ 完成工單 Complete</div>'
     +'<div class="btn-row"><button class="btn btn-primary" id="tq_complete" style="flex:1">✅ 儲存並完成工單 Save & Complete</button></div>'
     +'<div class="btn-row" style="margin-top:.4rem"><button class="btn btn-secondary" id="tq_saveonly" style="flex:1">💾 只更新狀態/零件(不標記完成) Save only</button></div>'
-    +'<div class="tq-note">此連結有時效('+(Number(config.stationTokenHours)||48)+'h)。變更會即時同步至系統。 This link is time-limited; changes sync to the system instantly.</div>';
+    +'<div class="tq-note">此連結冇時限,工單完成前一直有效。變更會即時同步至系統。 This link has no time limit and stays valid until the order is completed; changes sync to the system instantly.</div>';
   // 狀態標籤 status chip
   var st=document.getElementById('tq_statustag');
   if(st){ st.innerHTML='<span class="chip '+(o.status==='completed'?'success':o.status==='new'?'warning':'info')+'">'+esc(ORDER_STATUS[o.status]||o.status)+'</span>'; }
