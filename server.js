@@ -63,6 +63,14 @@ async function initDb() {
       store       JSONB NOT NULL DEFAULT '{}'::jsonb
     );
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS app_order_seq (
+      workspace   TEXT NOT NULL,
+      day_prefix  TEXT NOT NULL,
+      n           INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (workspace, day_prefix)
+    );
+  `);
   await pool.query('CREATE INDEX IF NOT EXISTS app_backups_ws_time ON app_backups (workspace, created_at DESC)');
   console.log('[db] app_state / app_backups 表已就緒 tables ready');
 }
@@ -133,6 +141,25 @@ function _freshNo(inner, no) {
   for (let i = 0; i < 3000; i++) { const n = pre + String(Math.floor(Math.random() * (i < 1500 ? 900 : 9000)) + (i < 1500 ? 100 : 1000)); if (!used.has(n)) return n; }
   return pre + String(Date.now()).slice(-6);
 }
+// v2.0.3:順序單號(每日每種由 001 開始)sequential order numbers per prefix per HK day, starting at 001
+function _usedNos(inner) {
+  const used = new Set(); _arr(inner.orders).forEach(o => o && o.no && used.add(String(o.no)));
+  _arr(inner.deletedOrders).forEach(t => t && t.no && used.add(String(t.no))); _arr(inner.logs).forEach(l => l && l.target && used.add(String(l.target)));
+  return used;
+}
+async function _seqNo(client, ws, inner, no) {
+  const pre = (String(no).match(/^([A-Z]+)-/) || [null, 'SR'])[1] + '-' + _hkDate() + '-';
+  const used = _usedNos(inner);
+  for (let i = 0; i < 5000; i++) {
+    const r = await client.query(`INSERT INTO app_order_seq (workspace, day_prefix, n) VALUES ($1, $2, 1)
+      ON CONFLICT (workspace, day_prefix) DO UPDATE SET n = app_order_seq.n + 1 RETURNING n`, [ws, pre]);
+    const cand = pre + String(r.rows[0].n).padStart(3, '0');
+    if (!used.has(cand)) return cand;
+  }
+  return _freshNo(inner, no);
+}
+// 已改號嘅舊單號 → 新單號 provisional number -> assigned number
+function _renameMap(orders) { const m = new Map(); _arr(orders).forEach(o => { if (o && o._renamedFrom && o.no) m.set(String(o._renamedFrom), o); }); return m; }
 function mergeInner(dbInner, inInner) {
   dbInner = dbInner || {}; inInner = inInner || {};
   const out = Object.assign({}, dbInner, inInner); // 其他資料:以送來嘅為準 other arrays: incoming wins (unchanged behaviour)
@@ -151,9 +178,12 @@ function mergeInner(dbInner, inInner) {
   const map = new Map();
   dbOrders.forEach(o => { if (o && o.no) map.set(String(o.no), o); });
   const inKeys = new Set();
+  const rmap = _renameMap(dbOrders);
   inOrders.forEach(o => {
     if (!o || !o.no) return; const k = String(o.no); inKeys.add(k);
     const cur = map.get(k);
+    // 裝置仲用緊臨時單號,但伺服器已派咗正式順序單號:唔好再加多張 device still has the provisional number of an order that was already renumbered
+    if (!cur && rmap.has(k) && !_distinctOrder(rmap.get(k), o)) { merged = true; return; }
     if (!cur) {
       // 已刪除嘅舊單唔好被舊裝置「復活」;但刪除之後先開嘅新單(撞號)照樣保留
       // don't resurrect a deleted order, but KEEP a newer order that merely reuses the number
@@ -180,7 +210,8 @@ function mergeInner(dbInner, inInner) {
   out.orders = extra.concat(order);
   // 日誌 logs:按 ts|action|target 去重 dedupe, newest first, keep 1000
   const lk = x => ((x && x.ts) || '') + '|' + ((x && x.action) || '') + '|' + ((x && x.target) || '');
-  const lmap = new Map(); _arr(dbInner.logs).forEach(x => lmap.set(lk(x), x)); _arr(inInner.logs).forEach(x => lmap.set(lk(x), x));
+  const _fix = x => { if (x && x.target && rmap.has(String(x.target)) && !map.has(String(x.target))) return Object.assign({}, x, { target: rmap.get(String(x.target)).no }); return x; };
+  const lmap = new Map(); _arr(dbInner.logs).forEach(x => lmap.set(lk(x), x)); _arr(inInner.logs).forEach(x => { x = _fix(x); lmap.set(lk(x), x); });
   if (lmap.size !== _arr(inInner.logs).length) merged = true;
   out.logs = Array.from(lmap.values()).sort((a, b) => ((b.ts || '') < (a.ts || '') ? -1 : ((b.ts || '') > (a.ts || '') ? 1 : 0))).slice(0, 1000);
   // 通知 / 郵件記錄:按 id 合併 notifications / emailLog by id
@@ -254,14 +285,18 @@ app.post('/api/orders', async (req, res) => {
     const clash = (idx >= 0 && _distinctOrder(orders[idx], order)) || (idx < 0 && delAt >= 0);
     let renamed = null;
     // 之前已經改過號(回應遺失後重試)previously renamed (retry after a lost response) -> reuse that record
-    const prev = clash ? orders.find(o => o && o._renamedFrom === k && !_distinctOrder(o, order)) : null;
+    const prev = (idx < 0 || clash) ? orders.find(o => o && o._renamedFrom === k && !_distinctOrder(o, order)) : null;
+    const seqNew = !prev && req.body.isNew && (idx < 0 || clash || !orders[idx]._seqNo);
     if (prev) { order.no = prev.no; order._renamedFrom = k; }
     if (prev) { /* fallthrough: treat as existing */ }
-    else if (clash && (req.body.isNew || idx >= 0)) {
+    else if (seqNew || (clash && idx >= 0)) {
       // 撞號(已有另一張單,或者呢個單號曾經刪除):改用新單號,兩張都保留
       // number clash (another order has it, or it was deleted before): assign a fresh number, keep both
-      renamed = _freshNo(inner, k);
-      order.no = renamed; order._renamedFrom = k;
+      // v2.0.3:新單一律由伺服器派順序單號 new orders always get the next sequential number from the server
+      if (idx >= 0 && !clash) { orders.splice(idx, 1); inner.logs = _arr(inner.logs).map(l => (l && l.target === k) ? Object.assign({}, l, { target: '__tmp__' }) : l); }
+      renamed = await _seqNo(client, ws, inner, k);
+      if (idx >= 0 && !clash) inner.logs = _arr(inner.logs).map(l => (l && l.target === '__tmp__') ? Object.assign({}, l, { target: renamed }) : l);
+      order.no = renamed; order._seqNo = true; if (renamed !== k) order._renamedFrom = k;
       if (log && log.target === k) log.target = renamed;
       if (notification && notification.orderNo === k) { notification.orderNo = renamed; if (typeof notification.text === 'string') notification.text = notification.text.split(k).join(renamed); }
     } else if (idx < 0 && delAt >= 0 && (Number(order._ts) || 0) <= delAt) {
