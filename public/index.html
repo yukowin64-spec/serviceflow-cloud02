@@ -3397,7 +3397,7 @@ let uidSeq = 100, cidSeq = 100;
 
 /* ================= APP VERSION ================= */
 /* 系統版本號 App version — 顯示於首頁與登入頁頁尾 shown in front/login page footer */
-const APP_VERSION = 'v2.0.5';
+const APP_VERSION = 'v2.0.6';
 const APP_BUILD = '2026-11-10';
 function applyAppVersion(){
   try{
@@ -4687,6 +4687,7 @@ function renderTechQuick(o){
     +'<span class="tq-badge">'+esc(o.no)+'</span></div>'
     +'<div class="tq-info">'
     +'<div class="full"><div class="k">狀態 Status</div><div class="v" id="tq_statustag"></div></div>'
+    +(_isReopenedOpen(o)?('<div class="full"><div class="k">🔁 未完成原因 Reopen Reason</div><div class="v" style="color:#c0392b;font-weight:700">'+esc(o.reopenNote)+(o.reopenCancelledManualNo?(' · 已取消手寫單 '+esc(o.reopenCancelledManualNo)):'')+'</div></div>'):'')
     +'<div><div class="k">公司 Company</div><div class="v">'+esc(companyName(o.companyId))+'</div></div>'
     +'<div><div class="k">機器 Machine</div><div class="v">'+esc(o.machineId)+(m&&m.name?(' · '+esc(m.name)):'')+'</div></div>'
     +'<div><div class="k">緊急 Urgency</div><div class="v">'+(o.urgency==='urgent'?'🔴 緊急 Urgent':'非緊急 Normal')+' '+over+'</div></div>'
@@ -5422,7 +5423,7 @@ function notifyNewOrderEmail(o){
     '',
     '— '+bn+' 自動報單系統 Auto Order System'
   ].filter(function(x){return x!=='';});
-  const subject='【'+_bnSys(bn)+'】新'+kindZh+' · '+o.no+' · '+coName;
+  const subject=(_isReopenedOpen(o)?('🔁 【'+_bnSys(bn)+'】工單改回未完成 Order Reopened · '+o.no+' · '+coName):('【'+_bnSys(bn)+'】新'+kindZh+' · '+o.no+' · '+coName));
   let _body=''; try{ _body=buildOrderText(o); }catch(_){ _body=''; } if(!_body) _body=lines.join('\n'); // 與 Telegram 同一格式 same format as Telegram
   try{ sendEmail(to, subject, _body, 'new_order', o.no); }catch(_){}
 }
@@ -5834,11 +5835,16 @@ function openOrderEdit(no){
       <div class="field"><label>聯絡人 Contact</label><input id="e_contact" value="${esc(o.contact)}"></div>
       <div class="field"><label>聯絡資料 Contact Value</label><input id="e_val" value="${esc(o.value)}"></div>
       <div class="field"><label>手寫單號 Manual Ticket No. <span class="small" style="opacity:.7">（選填，可後補 Optional）</span></label><input id="e_manualNo" value="${esc(o.manualNo||'')}" placeholder="例 04984 e.g. 04984"></div>
+      ${_reopenFieldHtml('e', o)}
     </div>
     <div class="btn-row"><button class="btn btn-primary" id="e_save">儲存 Save</button><button class="btn btn-secondary" onclick="document.getElementById('modalClose').click()">取消 Cancel</button></div>`);
   { const _eb=$('#e_bd'); if(_eb){ const _mn=(o.bookingDate && o.bookingDate<todayStr())?o.bookingDate:todayStr(); attachDatePicker(_eb,{min:_mn}); } }
   { const _ei=$('#e_idt'); if(_ei){ const _mi=(o.installDate && o.installDate<todayStr())?o.installDate:todayStr(); attachDatePicker(_ei,{min:_mi}); } }
+  _bindReopenField('e', o, 'e_status');
   $('#e_save').addEventListener('click',()=>{
+    const _reo=_isReopen(o, $('#e_status').value);
+    const _reoNote=_reo?(($('#e_reopenNote')&&$('#e_reopenNote').value.trim())||''):'';
+    if(_reo && !_reoNote){ toast('請手打輸入未完成原因 Please type the reason'); try{ $('#e_reopenNote').focus(); }catch(_){} return; }
     const _ebd=$('#e_bd').value;
     // 只在「新選」了一個早於今天的日期時阻止（保留原本的舊日期）。block only when a NEW past date is chosen
     if(_ebd && _ebd<todayStr() && _ebd!==o.bookingDate){ toast('預約日期不能早於今天 Booking date cannot be earlier than today'); return; }
@@ -5850,12 +5856,17 @@ function openOrderEdit(no){
     const changes=diffFields(oldC,newC,map);
     const wasCompleted=o.status==='completed';
     const _before=_snapOrder(o);
+    const _prevMno=o.manualNo||'';
     Object.assign(o,nv);
+    if(_reo){ o.manualNo=_prevMno; _applyReopen(o, _reoNote); } // 取消手寫單號 + 清除完成標記 cancel manual no. + clear completion markers
     touchOrder(o);
     if(recordEdit(o,'edit_order',o.no,changes)) toast('工單已修改 Order updated'); else toast('未有變動 No changes');
-    if(!wasCompleted && o.status==='completed') notifyOrderCompletedIfNeeded(o);
     closeModal(); refreshAll();
-    commitOrderEditUI(o, _before); // 寫入數據庫最新版本並核對 write onto the current DB record and verify
+    commitOrderEditUI(o, _before).then(function(r){ // 寫入數據庫最新版本並核對,成功先發通知 write onto the current DB record and verify; notify only after success
+      if(!r||!r.ok) return;
+      if(_reo) _afterReopenCommitted(o);
+      else if(!wasCompleted && o.status==='completed') notifyOrderCompletedIfNeeded(o);
+    });
   });
 }
 function deleteOrder(no){
@@ -7188,6 +7199,7 @@ function openOrderModal(no){
       <div class="full"><div class="k">建立時間 Created</div><div class="v">${esc(o.created)}</div></div>
     </div>
     ${can('orders')?`<div class="field"><label>更新狀態 Update Status</label><select id="m_status">${Object.keys(ORDER_STATUS).map(k=>`<option value="${k}" ${o.status===k?'selected':''}>${ORDER_STATUS[k]}</option>`).join('')}</select></div>
+    ${_reopenFieldHtml('m', o)}
     <div id="m_partsWrap">
       <p class="sect-title" style="margin:.6rem 0 .4rem">更換零件 Parts Replaced
         <span class="small" style="font-weight:400">（可多於一件;選錯可更換或移除 multiple allowed, editable）</span></p>
@@ -7211,10 +7223,15 @@ function openOrderModal(no){
       else if(wrap){ wrap.innerHTML=''; }
     };
     $('#m_status').addEventListener('change', syncPartsUI);
+    _bindReopenField('m', o, 'm_status');
     $('#m_addRow').addEventListener('click',()=>{ if($('#m_status').value!=='completed'){ toast('請先將狀態設為已完成 Set status to Completed first'); return; } _mRows.push({partId:'', qty:1}); renderPartRows('m_rows', o.companyId, _mRows); });
     syncPartsUI();
 
     $('#m_saveOrder').addEventListener('click',()=>{
+      window.__mDoneNotify=null;
+      const _reo=_isReopen(o, $('#m_status').value);
+      const _reoNote=_reo?(($('#m_reopenNote')&&$('#m_reopenNote').value.trim())||''):'';
+      if(_reo && !_reoNote){ toast('請手打輸入未完成原因 Please type the reason'); try{ $('#m_reopenNote').focus(); }catch(_){} return; }
       const _before=_snapOrder(o);
       const wasCompleted=o.status==='completed';
       const old=ORDER_STATUS[o.status]||o.status;
@@ -7231,17 +7248,18 @@ function openOrderModal(no){
         if(o.partsUsedLog==null) o.partsUsedLog=[];
         if(!wasCompleted){
           o.partsUsedLog.push({ts:nowStr(), by:curUser(), part:(partText||'（無零件 no parts）')});
-          notifyRepairDoneToAdmin(o, partText);      // 推送到「維修完成訊息」鈴鐺 push to repair-completed bell
-          notifyOrderCompletedIfNeeded(o);           // 已登入略過;免登入才發 skip when logged in
+          window.__mDoneNotify=function(){ notifyRepairDoneToAdmin(o, partText); notifyOrderCompletedIfNeeded(o); }; // 數據庫確認後先發 after DB confirms
         }
       } else {
         // 非完成狀態:退回之前扣減的零件(如有),不扣庫。Non-completed: restore any previously deducted parts.
         if(Array.isArray(o.partsUsed) && o.partsUsed.length){ setOrderParts(o, [], '後台改回未完成 admin revert'); }
         reopenOrderClearCompletion(o); // 由已完成改回非完成:清除完成標記,避免同步後被 _healOrders 打回 clear completion markers
+        if(_reo) _applyReopen(o, _reoNote);
       }
       touchOrder(o);
       refreshAll(); closeModal(); toast('工單已更新 Order updated');
-      commitOrderEditUI(o, _before);
+      const _dn=window.__mDoneNotify; window.__mDoneNotify=null;
+      commitOrderEditUI(o, _before).then(function(r){ if(!(r&&r.ok)) return; if(_reo) _afterReopenCommitted(o); else if(_dn){ try{ _dn(); }catch(_){} } });
     });
   }
 }
@@ -8417,12 +8435,17 @@ function buildOrderText(order){
     door:_door,
     manual:(order.manualNo||'')
   };
-  var def='🔔 【'+_bnSys(bn)+'】新工單 New Service Order · '+vals.no+'\n\n'+
+  var _ro=_isReopenedOpen(order);
+  var def=(_ro?('🔁 【'+_bnSys(bn)+'】工單改回未完成 Order Reopened (Not Completed) · '+vals.no+'\n\n'):('🔔 【'+_bnSys(bn)+'】新工單 New Service Order · '+vals.no+'\n\n'))+
     '👉 師父維修工單站 Repair Station（點入直接更改工單 tap to open & update）：\n'+vals.link+'\n\n'+
     '負責人您好 Dear Owner，\n\n'+
-    '收到一張新的工單，詳情如下：\nA new service order has been created:\n'+
+    (_ro?'以下工單已改回未完成，需要再處理：\nThe following order has been reopened and needs further work:\n':'收到一張新的工單，詳情如下：\nA new service order has been created:\n')+
     '════════════════════\n'+
-    '🆕 狀態 Status       ：新建立 New\n'+
+    (_ro?('🔁 狀態 Status       ：未完成(重開) Reopened · '+statusDisp(order.status)+'\n'+
+      '🗒️ 未完成原因 Reason ：'+order.reopenNote+'\n'+
+      (order.reopenCancelledManualNo?('🚫 已取消手寫單號 Cancelled Manual No.：'+order.reopenCancelledManualNo+'\n'):'')+
+      '👤 重開 Reopened by  ：'+(order.reopenedBy||'-')+' · '+(order.reopenedAt||'')+'\n')
+     :'🆕 狀態 Status       ：新建立 New\n')+
     '🆔 工單編號 Order No.  ：'+vals.no+'\n'+
     (order.manualNo?('📝 手寫單號 Manual Ticket：'+order.manualNo+'\n'):'')+
     '📋 類型 Type           ：'+vals.kind+'\n'+
@@ -8477,10 +8500,42 @@ function sendCompletionToN8n(order){
     .catch(()=>{ toast('n8n 完成通知發送失敗 Completion send failed'); });
 }
 // 完成工單 Telegram 內文(中英雙語)。Completion Telegram text (bilingual).
+// ===== v2.0.6:已完成工單改回未完成 Reopen a completed order =====
+function _reopenFieldHtml(px, o){
+  return '<div class="field full" id="'+px+'_reopenWrap" style="display:none;border:2px solid #c0392b;border-radius:10px;padding:.6rem .7rem;background:rgba(192,57,43,.06)">'
+    +'<label>🔁 未完成原因 Reason (必須手打輸入 Required)</label>'
+    +'<textarea id="'+px+'_reopenNote" placeholder="例:師傅未修好、零件未到、客戶話仍有問題… e.g. not fixed yet"></textarea>'
+    +'<div class="small" style="margin-top:.35rem">改回未完成會：① 取消手寫單號'+(o.manualNo?(' <b>'+esc(o.manualNo)+'</b>'):'')+' ② 重新發送工單通知(Telegram + Email)。<br>Reopening will cancel the manual ticket no. and re-send the order notification (Telegram + Email).</div></div>';
+}
+function _isReopen(o, newStatus){ return !!o && o.status==='completed' && newStatus!=='completed' && newStatus!=='cancelled'; }
+function _bindReopenField(px, o, selId){
+  var sel=document.getElementById(selId), wrap=document.getElementById(px+'_reopenWrap'); if(!sel||!wrap) return;
+  var f=function(){ wrap.style.display=_isReopen(o, sel.value)?'':'none'; };
+  sel.addEventListener('change', function(){ f(); if(wrap.style.display===''){ try{ wrap.scrollIntoView({block:'center',behavior:'smooth'}); var t=document.getElementById(px+'_reopenNote'); if(t) setTimeout(function(){ t.focus(); },300); }catch(_){} } }); f();
+}
+// 套用重開:取消手寫單號、記錄原因 apply reopen: cancel manual no., record reason
+function _applyReopen(o, note){
+  o.reopenCancelledManualNo=o.manualNo||'';
+  o.manualNo='';
+  o.reopenNote=note; o.reopenedAt=nowStr(); o.reopenedBy=curUser();
+  o.reopenCount=(Number(o.reopenCount)||0)+1;
+  if(o.partsUsedLog==null) o.partsUsedLog=[];
+  o.partsUsedLog.push({ts:nowStr(), by:curUser(), part:'🔁 改回未完成 Reopened · '+note+(o.reopenCancelledManualNo?(' · 取消手寫單 '+o.reopenCancelledManualNo):'')});
+  reopenOrderClearCompletion(o);
+}
+// 數據庫確認後:寫日誌 + 重新發送工單通知(即使已登入都會發)after DB confirms: log + re-send order notification (even when logged in)
+function _afterReopenCommitted(o){
+  try{ addLog('reopen_order', o.no, '改回未完成 Reopened · 原因 '+(o.reopenNote||'')+(o.reopenCancelledManualNo?(' · 取消手寫單 '+o.reopenCancelledManualNo):'')); }catch(_){}
+  try{ sendToN8n(o); }catch(_){}
+  try{ notifyNewOrderEmail(o); }catch(_){}
+  try{ saveStore(); }catch(_){}
+  try{ toast('🔁 已改回未完成並重新發送工單通知 Reopened & order notification re-sent'); }catch(_){}
+}
+function _isReopenedOpen(o){ return !!(o && o.reopenNote && o.status!=='completed' && o.status!=='cancelled'); }
 // 同一公司嘅其他未完成工單(只限同一品牌/公司)other unfinished orders of the SAME company only
 function _openOrdersBlock(o){
   if(!o || o.kind==='external' || !o.companyId) return '';
-  var list=(store.orders||[]).filter(function(x){ return x && x.no!==o.no && x.companyId===o.companyId && x.kind!=='external' && x.status!=='completed' && x.status!=='cancelled'; });
+  var list=(store.orders||[]).filter(function(x){ return x && x.no!==o.no && x.companyId===o.companyId && x.kind!=='external' && x.kind!=='inspection' && !/^IN-/.test(String(x.no||'')) && x.status!=='completed' && x.status!=='cancelled'; });
   var c=store.companies.find(function(x){return x.id===o.companyId;});
   var cn=c?((c.name_zh||'')+(c.name_en?(' '+c.name_en):'')):'';
   var head='📌 '+cn+' 未完成工單 Unfinished Orders（'+list.length+'）：\n';
@@ -8519,6 +8574,7 @@ function buildCompletionText(o){
     '👷 處理人 Technician    ：'+doneBy+'\n'+
     '🔩 更換零件 Parts Used  ：'+partDisplay+'\n'+
     (o.irreparable?'⛔ 需更換整台設備 Whole-unit replacement needed\n':'')+
+    (o.reopenNote?('🔁 曾改回未完成 Reopened：'+o.reopenNote+'\n'):'')+
     '════════════════════\n'+
     (function(){ var b=_openOrdersBlock(o); return b?(b+'════════════════════\n'):''; })()+'\n'+
     '此通知由系統自動發送。This notification was sent automatically.';
