@@ -261,6 +261,55 @@ app.get('/api/orders/:no', async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
+// ---- v2.0.5:更新現有工單 — 直接喺數據庫最新版本上改,唔用裝置舊副本 ----
+// Update an existing order: apply only the changed fields onto the CURRENT database record (never a device's stale copy),
+// then return the record as written in the database so the device can confirm.
+app.post('/api/orders/:no/patch', async (req, res) => {
+  const ws = wsKey(req);
+  const k = String(req.params.no || '').trim();
+  const { patch, log, notification } = req.body || {};
+  if (!k || !patch || typeof patch !== 'object') return res.status(400).json({ ok: false, error: 'missing patch' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const r = await client.query('SELECT store FROM app_state WHERE workspace = $1 FOR UPDATE', [ws]);
+    if (!r.rows.length) { await client.query('ROLLBACK'); return res.status(409).json({ ok: false, error: 'no state yet' }); }
+    const st = r.rows[0].store || {}; const inner = Object.assign({}, st.store || {});
+    const orders = _arr(inner.orders).slice();
+    const idx = orders.findIndex(x => x && String(x.no) === k);
+    if (idx < 0) {
+      await client.query('ROLLBACK');
+      const del = _deletedAt(inner, k);
+      return res.status(404).json({ ok: false, found: false, deleted: del >= 0 });
+    }
+    const cur = Object.assign({}, orders[idx]);
+    const PROTECT = new Set(['no', 'created', '_renamedFrom', '_seqNo', '_clashOf']);
+    Object.keys(patch).forEach(f => {
+      if (PROTECT.has(f) || f === '_ts') return;
+      if (patch[f] === null || patch[f] === undefined) delete cur[f]; else cur[f] = patch[f];
+    });
+    cur._ts = Math.max(Date.now(), (Number(orders[idx]._ts) || 0) + 1, Number(patch._ts) || 0);
+    orders[idx] = cur; inner.orders = orders;
+    if (log && log.ts) {
+      const lk = x => ((x && x.ts) || '') + '|' + ((x && x.action) || '') + '|' + ((x && x.target) || '');
+      const logs = _arr(inner.logs); if (!logs.some(x => lk(x) === lk(log))) inner.logs = [log].concat(logs).slice(0, 1000);
+    }
+    if (notification && notification.id) {
+      const ns = _arr(inner.notifications); if (!ns.some(x => x && x.id === notification.id)) inner.notifications = [notification].concat(ns).slice(0, 300);
+    }
+    const newStore = Object.assign({}, st, { store: inner });
+    const w = await client.query('UPDATE app_state SET store = $2::jsonb, updated_at = now() WHERE workspace = $1 RETURNING updated_at, store', [ws, JSON.stringify(newStore)]);
+    await client.query('COMMIT');
+    // 由數據庫寫入結果讀返出嚟確認 read back from the written row to confirm
+    const saved = _arr(((w.rows[0].store || {}).store || {}).orders).find(x => x && String(x.no) === k) || null;
+    res.json({ ok: !!saved, order: saved, updated_at: w.rows[0].updated_at });
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    console.error('[PATCH order]', e);
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  } finally { client.release(); }
+});
+
 // ---- 即時儲存單一新工單 Save ONE new order atomically (front page submits) ----
 // 工單先存入資料庫,成功後前端先發 Telegram/Email,確保「有通知就一定有單」。
 // The order is saved first; only after success does the client send notifications.

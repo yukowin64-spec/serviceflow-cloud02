@@ -3376,6 +3376,8 @@ const store = {
   ]
 };
 
+const STATUS_ICON = {new:'🆕', in_progress:'🔧', completed:'✅', cancelled:'❌', scheduled:'📅', waiting_parts:'📦', pending:'⏳'};
+function statusDisp(s){ return (STATUS_ICON[s]?STATUS_ICON[s]+' ':'')+(ORDER_STATUS[s]||s||''); }
 const ORDER_STATUS = {new:'新建立 New', in_progress:'處理中 In Progress', completed:'已完成 Completed', cancelled:'已取消 Cancelled', scheduled:'已預約 Scheduled', waiting_parts:'等待零件 Waiting Parts', pending:'待處理 Pending'};
 const ROLE_LABEL = {admin:'管理員 Admin', operator:'操作員 Operator', viewer:'查看者 Viewer', technician:'維修師父 Technician'};
 const NAV = [
@@ -3395,7 +3397,7 @@ let uidSeq = 100, cidSeq = 100;
 
 /* ================= APP VERSION ================= */
 /* 系統版本號 App version — 顯示於首頁與登入頁頁尾 shown in front/login page footer */
-const APP_VERSION = 'v2.0.4';
+const APP_VERSION = 'v2.0.5';
 const APP_BUILD = '2026-11-10';
 function applyAppVersion(){
   try{
@@ -3426,7 +3428,77 @@ function loadConfig(){ try{ const s=safeStore.getItem('vf_config'); if(s) config
 function saveConfig(){ try{ safeStore.setItem('vf_config', JSON.stringify(config)); }catch(e){} try{ if(typeof CLOUD!=='undefined') CLOUD.pushDebounced(); }catch(e){} }
 // touchOrder:為工單打一個毫秒時間戳，供雲端合併時「較新者勝」判斷，防止舊裝置覆蓋別人剛完成的新狀態。
 // Stamp an order with a millisecond timestamp so cloud merge (last-write-wins) knows this is the freshest change and a stale device can't clobber it.
-function touchOrder(o){ if(o && typeof o==='object'){ o._ts = Date.now(); } return o; }
+function touchOrder(o){ if(o && typeof o==='object'){ _adoptOrder(o); } return o; } // v2.0.5:版本由數據庫決定 version is assigned by the database (commitOrderEdit)
+// ===== v2.0.5:更新工單一律寫入數據庫最新版本 Every order update is applied to the CURRENT database record =====
+function _snapOrder(o){ try{ return JSON.parse(JSON.stringify(o||{})); }catch(_){ return {}; } }
+function _orderDiff(before, after){
+  var p={}, n=0; before=before||{}; after=after||{};
+  Object.keys(after).forEach(function(k){ if(k==='_ts'||k==='no') return; if(_stableStr(after[k])!==_stableStr(before[k])){ p[k]=(after[k]===undefined?null:after[k]); n++; } });
+  Object.keys(before).forEach(function(k){ if(k==='_ts'||k==='no') return; if(!(k in after)){ p[k]=null; n++; } });
+  return n?p:null;
+}
+function _setOrderInPlace(o, src){ Object.keys(o).forEach(function(f){ if(!(f in src)) delete o[f]; }); Object.assign(o, src); }
+// 將改動寫入數據庫,並用數據庫寫入後嘅結果更新本機 write changes to the DB, then refresh the local copy from what the DB actually stored
+// 穩定序列化(數據庫 JSONB 會重排欄位次序)stable stringify: PostgreSQL JSONB reorders object keys
+function _stableStr(v){ if(v===undefined) return 'undefined'; if(v===null||typeof v!=='object') return JSON.stringify(v); if(Array.isArray(v)) return '['+v.map(_stableStr).join(',')+']'; return '{'+Object.keys(v).filter(function(k){ return v[k]!==undefined; }).sort().map(function(k){ return JSON.stringify(k)+':'+_stableStr(v[k]); }).join(',')+'}'; }
+async function commitOrderEdit(o, before){
+  var patch=_orderDiff(before, o);
+  if(!patch) return { ok:true, unchanged:true };
+  var d=null;
+  for(var i=0;i<3 && !d;i++){
+    try{
+      var r=await fetch('/api/orders/'+encodeURIComponent(o.no)+'/patch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({patch:patch})});
+      var j=null; try{ j=await r.json(); }catch(_){}
+      if(r.ok && j && j.ok && j.order){ d=j; break; }
+      if(r.status===404) return { ok:false, missing:true, deleted:!!(j&&j.deleted) };
+    }catch(e){}
+    await new Promise(function(res){ setTimeout(res, 1000*(i+1)); });
+  }
+  if(!d) return { ok:false, network:true };
+  // 核對:數據庫版本係咪真係包含今次改動 verify the database copy really contains this change
+  var bad=Object.keys(patch).filter(function(k){ var v=patch[k]; var dv=d.order[k]; return v===null ? (dv!==undefined && dv!==null) : _stableStr(dv)!==_stableStr(v); });
+  if(bad.length) return { ok:false, mismatch:bad };
+  _setOrderInPlace(o, d.order); _adoptOrder(o);
+  try{ saveStoreLocalOnly(); }catch(_){}
+  return { ok:true, order:d.order };
+}
+function _commitFailMsg(r){
+  if(r&&r.missing) return r.deleted?'工單已被刪除,未能更新 Order was deleted; not updated':'數據庫找不到此工單,未能更新 Order not found in database; not updated';
+  if(r&&r.mismatch) return '數據庫核對失敗,請再試 Database verification failed, please retry';
+  return '未能連接數據庫,改動未儲存,請檢查網絡後再試 Could not reach the database; NOT saved. Check network and retry';
+}
+// 管理端用:寫入失敗就還原本機改動並提示 admin helper: on failure revert the local edit and warn
+function commitOrderEditUI(o, before){
+  return commitOrderEdit(o, before).then(function(r){
+    if(r.ok){ if(!r.unchanged){ try{ toast('✅ 已寫入數據庫 Saved to database · '+o.no); }catch(_){} } try{ refreshAll(); }catch(_){} }
+    else { _setOrderInPlace(o, before); try{ saveStoreLocalOnly(); refreshAll(); }catch(_){} try{ alert('⚠ '+o.no+':'+_commitFailMsg(r)); }catch(_){ toast(_commitFailMsg(r)); } }
+    return r;
+  });
+}
+// v2.0.5:雲端同步可能已換走工單物件;確保改動嘅物件就係 store 入面嗰張(否則改動會靜靜雞消失)
+// v2.0.5: a cloud sync may have swapped the order object; make sure the edited object IS the one in the store (otherwise the edit is silently lost)
+function _adoptOrder(o){
+  try{
+    if(!o||!o.no||!Array.isArray(store.orders)) return;
+    var i=store.orders.findIndex(function(x){ return x&&x.no===o.no; });
+    if(i>=0){ if(store.orders[i]!==o) store.orders[i]=o; }
+    else { var tm=(typeof _tombMap==='function')?_tombMap():null; var t=tm?tm.get(String(o.no)):undefined; if(t===undefined) store.orders.unshift(o); }
+  }catch(_){}
+}
+// 改動即時直接寫入雲端(原子操作),唔使等整包同步 save the changed order straight to the cloud (atomic), not only via the full-state push
+var _saveNowT={};
+function _saveOrderSoon(o){
+  try{
+    var no=o.no; clearTimeout(_saveNowT[no]);
+    _saveNowT[no]=setTimeout(function(){
+      try{
+        if(typeof _outboxHas==='function' && _outboxHas(no)) return; // 新單仍等緊上載 new order still uploading via outbox
+        var cur=(store.orders||[]).find(function(x){ return x&&x.no===no; }); if(!cur) return;
+        if(typeof CLOUD!=='undefined' && CLOUD.saveOrder) CLOUD.saveOrder(cur, null, null, false, false);
+      }catch(_){}
+    }, 400);
+  }catch(_){}
+}
 // 重開工單:由「已完成」改回非完成狀態時,必須清除 completedAt/completedBy,
 // 否則 _healOrders 會依殘留的 completedAt 自動把它打回「已完成」,造成師傅改「等待零件」後又彈回完成。
 // Reopen an order: when moving away from completed, clear completedAt/completedBy so _healOrders won't force it back to completed.
@@ -3564,6 +3636,10 @@ const CLOUD = (function(){
         const cur=map.get(kk);
         const lt=Number(x&&x[tsKey])||0, ct=Number(cur&&cur[tsKey])||0;
         if(lt>=ct){ map.set(kk,x); }  // 本地較新(或平手取本地)才覆蓋 local newer (or tie) wins
+        else if(x && cur && typeof x==='object' && typeof cur==='object'){
+          // 雲端較新:就地更新本地物件(保持同一個物件,畫面/表單持有嘅參照唔會失效)cloud newer: update the local object in place so held references stay valid
+          Object.keys(x).forEach(function(f){ if(!(f in cur)) delete x[f]; }); Object.assign(x, cur); map.set(kk,x);
+        }
         // 否則保留雲端較新那筆(不覆蓋)otherwise keep the newer cloud record
       } else {
         map.set(kk,x); // 無 tsKey 或雲端無此筆：本地優先 local wins
@@ -3657,7 +3733,7 @@ function applyCloudState(d, seedLocalToo){
         if(Array.isArray(o.store.machines)) store.machines=o.store.machines;
         // 工單:輪詢同步時用時間戳合併(本地未推送的新改動不會被雲端舊快照覆蓋);僅首次 seed 時直接採用雲端。
         // Orders: on poll-sync use last-write-wins merge so local un-pushed changes aren't clobbered by a stale cloud snapshot; only take cloud wholesale on the first seed.
-        if(Array.isArray(o.store.orders)) store.orders = seedLocalToo ? o.store.orders : mergeById(store.orders, o.store.orders, 'no', '_ts');
+        if(Array.isArray(o.store.orders)) store.orders = seedLocalToo ? _adoptInPlace(store.orders, o.store.orders) : mergeById(store.orders, o.store.orders, 'no', '_ts');
         if(Array.isArray(o.store.users)&&o.store.users.length) store.users=o.store.users;
         if(Array.isArray(o.store.parts)) store.parts=o.store.parts;
         if(Array.isArray(o.store.warehouses)) store.warehouses=o.store.warehouses;
@@ -3690,6 +3766,18 @@ function applyCloudState(d, seedLocalToo){
   }catch(e){ try{ console.warn('applyCloudState error', e); }catch(_){} }
 }
 
+// 首次載入雲端資料:用雲端內容,但保留本地同號工單嘅物件身份 first cloud seed: take cloud content but keep object identity of local orders with the same number
+function _adoptInPlace(localArr, cloudArr){
+  var lm=new Map(); (Array.isArray(localArr)?localArr:[]).forEach(function(x){ if(x&&x.no) lm.set(String(x.no), x); });
+  return cloudArr.map(function(c){
+    var l=c&&c.no?lm.get(String(c.no)):null;
+    if(l && l!==c && typeof c==='object'){
+      if((Number(l._ts)||0)>(Number(c._ts)||0)) return l; // 本地較新(未上載改動)keep newer local edit
+      Object.keys(l).forEach(function(f){ if(!(f in c)) delete l[f]; }); Object.assign(l, c); return l;
+    }
+    return c;
+  });
+}
 function saveStoreLocalOnly(){ try{ safeStore.setItem('vf_store', JSON.stringify({ seq:{uidSeq:uidSeq,cidSeq:cidSeq}, store:{ companies:store.companies, machines:store.machines, orders:store.orders, users:store.users, parts:store.parts, warehouses:store.warehouses, whMachines:store.whMachines, itAssets:store.itAssets, notifications:store.notifications, emailLog:store.emailLog, logs:store.logs, deletedOrders:(store.deletedOrders||[]) } })); }catch(e){} }
 function saveConfigLocalOnly(){ try{ safeStore.setItem('vf_config', JSON.stringify(config)); }catch(e){} }
 function applyBranding(){
@@ -4542,6 +4630,18 @@ function _orderMissingMsg(no, d){
 function openTechQuick(no, tok, _retry){
   no=(no||'').trim(); tok=(tok||'').trim();
   _showTechQuickOnly();
+  // v2.0.5:開頁先由數據庫讀最新工單(唔用手機舊快取)load the CURRENT order from the database first (not the phone's old cache)
+  if(_retry===undefined && window.__tqDbNo!==no){
+    window.__tqDbNo=no;
+    var _c=document.getElementById('tqCard'); if(_c) _c.innerHTML='<div class="tq-head"><div class="logo">🔧</div><div><div class="tq-title">載入中… Loading…</div><div class="tq-sub">正在由數據庫讀取工單 Reading order from database</div></div></div>';
+    var _ac=(typeof AbortController!=='undefined')?new AbortController():null; var _to=setTimeout(function(){ try{ _ac&&_ac.abort(); }catch(_){} }, 8000);
+    fetch('/api/orders/'+encodeURIComponent(no),{cache:'no-store', signal:_ac?_ac.signal:undefined}).then(function(r){ return r.json(); }).then(function(d){
+      clearTimeout(_to);
+      if(d && d.found && d.order){ var li=(store.orders||[]).find(function(x){ return x&&x.no===no; }); if(li) _setOrderInPlace(li, d.order); else _injectCloudOrder(d.order); try{ saveStoreLocalOnly(); }catch(_){} }
+      else if(d && d.found===false && !(typeof _outboxHas==='function' && _outboxHas(no))){ store.orders=(store.orders||[]).filter(function(x){ return !(x&&x.no===no); }); window.__tqMiss={no:no, d:d}; }
+    }).catch(function(){ clearTimeout(_to); }).then(function(){ openTechQuick(no, tok, 0); });
+    return;
+  }
   // 資料可能仲未由雲端載入 order may not be synced yet — wait & retry a few times
   var o=store.orders.find(function(x){return x.no===no;});
   if(!o){
@@ -4556,6 +4656,10 @@ function openTechQuick(no, tok, _retry){
     return;
   }
   // 驗證 token(未過期 + 簽章正確)。verify token (not expired + valid signature)
+  if(!verifyStationToken(no, tok) && !config.stationSecret && (_retry||0)<40){
+    // 新裝置:系統設定未由雲端載入,稍等再驗證 new device: settings not loaded from cloud yet, wait then verify
+    setTimeout(function(){ openTechQuick(no,tok,(_retry||0)+1); }, 500); return;
+  }
   if(!verifyStationToken(no, tok)){
     _tqError('連結無效 Invalid link', '此免登入連結無效(連結不完整或已被修改)。<br>This no-login link is invalid (incomplete or altered). 請通知管理員重新發送工單通知。 Please ask the admin to resend the order notification.');
     return;
@@ -4631,7 +4735,17 @@ function renderTechQuick(o){
   document.getElementById('tq_complete').addEventListener('click', function(){ _tqSubmit(o, true); });
 }
 // 提交(免登入)。complete=true 代表標記完成。Submit without a session; complete=true marks the order completed.
-function _tqSubmit(o, complete){
+var _tqBusy=false;
+async function _tqSubmit(o, complete){
+  if(_tqBusy) return; _tqBusy=true;
+  var _btns=['tq_complete','tq_saveonly'].map(function(id){ return document.getElementById(id); }).filter(Boolean);
+  _btns.forEach(function(b){ b.disabled=true; b.dataset.t=b.textContent; b.textContent='⏳ 儲存到數據庫中… Saving to database…'; });
+  try{
+  // 先由數據庫攞最新版本(唔用手機舊副本)first load the CURRENT database version (never the phone's stale copy)
+  try{ var _r=await fetch('/api/orders/'+encodeURIComponent(o.no),{cache:'no-store'}); var _d=await _r.json(); if(_d&&_d.found&&_d.order){ var _li=(store.orders||[]).find(function(x){ return x&&x.no===o.no; }); if(_li){ _setOrderInPlace(_li,_d.order); o=_li; } else { _injectCloudOrder(_d.order); o=store.orders.find(function(x){ return x&&x.no===_d.order.no; })||o; } } }catch(_){}
+  try{ var _live=(store.orders||[]).find(function(x){ return x&&x.no===o.no; }); if(_live && _live!==o){ o=_live; } }catch(_){}
+  var _before=_snapOrder(o), _partsBefore=Array.isArray(o.partsUsed)?JSON.parse(JSON.stringify(o.partsUsed)):[];
+  var _pending=[]; // 寫入數據庫成功後先做 run only after the database confirms
   var clean=_tqRows.filter(function(r){return r.partId;}).map(function(r){return {partId:r.partId, qty:Math.max(1,Number(r.qty)||1)};});
   var irreparable=document.getElementById('tq_irreparable').checked;
   var newStatus=document.getElementById('tq_status').value;
@@ -4656,25 +4770,41 @@ function _tqSubmit(o, complete){
     if(!o.assignedTech) o.assignedTech=actor;
     var logParts=partText || (irreparable?'（整台更換 whole-unit）':'（無零件 no parts）');
     o.partsUsedLog.push({ts:nowStr(), by:actor, part:logParts});
-    try{ addLog('tech_complete', o.no, '師傅免登入完成維修 · 零件 '+logParts+(irreparable?' · ⚠ 需更換整台設備 whole-unit':'')); }catch(e){}
+    _pending.push(function(){ try{ addLog('tech_complete', o.no, '師傅免登入完成維修 · 零件 '+logParts+(o.manualNo?(' · 手寫單 '+o.manualNo):'')+(irreparable?' · ⚠ 需更換整台設備 whole-unit':'')); }catch(e){} });
     if(!wasCompleted){
-      try{ notifyRepairDoneToAdmin(o, partText + (irreparable?'（整台更換 whole-unit）':'')); }catch(e){}
-      try{ notifyOrderCompleted(o); }catch(e){}
+      _pending.push(function(){ try{ notifyRepairDoneToAdmin(o, partText + (irreparable?'（整台更換 whole-unit）':'')); }catch(e){} });
+      _pending.push(function(){ try{ notifyOrderCompleted(o); }catch(e){} });
     }
   } else {
     o.status=newStatus;
     reopenOrderClearCompletion(o); // 改回非完成狀態時清除完成標記,避免被 _healOrders 打回完成 clear completion markers so heal won't force back to completed
     var lp=partText || '（狀態更新 status update）';
     o.partsUsedLog.push({ts:nowStr(), by:actor, part:'狀態→'+(ORDER_STATUS[newStatus]||newStatus)+(partText?(' · '+partText):'')});
-    try{ addLog('edit_order', o.no, '師傅免登入更新 · 狀態 '+(ORDER_STATUS[newStatus]||newStatus)+(partText?(' · 零件 '+partText):'')); }catch(e){}
+    _pending.push(function(){ try{ addLog('edit_order', o.no, '師傅免登入更新 · 狀態 '+(ORDER_STATUS[newStatus]||newStatus)+(o.manualNo?(' · 手寫單 '+o.manualNo):'')+(partText?(' · 零件 '+partText):'')); }catch(e){} });
   }
-  touchOrder(o); // 打時間戳:確保師傅完成的新狀態不會被別部舊裝置覆蓋 stamp so this fresh change wins the cloud merge
-  saveStore(); // 本機儲存 + 推送雲端 persist locally + push to cloud
+  // 寫入數據庫並核對 write to the database and verify
+  var _res=await commitOrderEdit(o, _before);
+  if(!_res.ok){
+    // 失敗:還原本機改動(包括零件庫存),提示師傅再試 failed: revert local changes (incl. stock) and ask to retry
+    try{ setOrderParts(o, _partsBefore, actor); }catch(_){}
+    if(complete && clean.length && m){ m.repairs=Math.max(0,(m.repairs||0)-1); }
+    _setOrderInPlace(o, _before); try{ saveStoreLocalOnly(); }catch(_){}
+    var _msg=document.getElementById('tq_saveMsg');
+    if(!_msg){ _msg=document.createElement('div'); _msg.id='tq_saveMsg'; _msg.style.cssText='margin-top:.6rem;padding:.6rem .7rem;border-radius:10px;background:rgba(192,57,43,.12);color:#c0392b;font-weight:600'; var _cb=document.getElementById('tq_complete'); if(_cb&&_cb.parentNode&&_cb.parentNode.parentNode) _cb.parentNode.parentNode.insertBefore(_msg,_cb.parentNode); }
+    _msg.textContent='⚠ '+_commitFailMsg(_res);
+    return;
+  }
+  _pending.forEach(function(f){ f(); });
+  saveStore(); // 日誌/通知/庫存同步 sync logs, notifications, stock
   // 即時更新後台工單列表與 Dashboard(若管理端已登入並在同一頁面),無須等雲端輪詢。
   // Immediately refresh the backend order list + dashboard so status changes show up right away.
   try{ if(session){ if(typeof renderOrders==='function') renderOrders(); if(typeof renderDashboard==='function') renderDashboard(); if(typeof renderMachines==='function') renderMachines(); if(typeof renderAdminBell==='function') renderAdminBell(); } }catch(e){}
   // 重繪為唯讀完成畫面 re-render as a confirmation screen
   _tqDone(o, complete);
+  } finally {
+    _tqBusy=false;
+    _btns.forEach(function(b){ if(document.body.contains(b)){ b.disabled=false; if(b.dataset.t) b.textContent=b.dataset.t; } });
+  }
 }
 function _tqDone(o, complete){
   var card=document.getElementById('tqCard'); if(!card) return;
@@ -5316,14 +5446,16 @@ function notifyOrderCompleted(o){
   const doneTime=o.completedAt||nowStr();
   const doneBy=(o.completedBy||(session&&session.user&&session.user.username)||'—');
   const partDisplay=partText?partText:(o.irreparable?'需更換整台設備 Whole-unit replacement':'無 None');
-  const subj='【'+bn+'】維修完成通知 Repair Completed · '+o.no;
+  const subj='✅ 【'+_bnSys(bn)+'】維修完成通知 Repair Completed · '+o.no+(o.manualNo?(' · 手寫單 '+o.manualNo):'');
   // 客戶通知(簡潔)。Customer notification (concise).
   const custBody=
     '尊敬的客戶 Dear Customer，\n\n'+
     '您的維修工單已完成 Your service order is completed。\n'+
     '────────────────────\n'+
     '工單編號 Order No.  ：'+o.no+'\n'+
+    (o.manualNo?('手寫單號 Manual Ticket：'+o.manualNo+'\n'):'')+
     '設備 Machine        ：'+machineLabel+'\n'+
+    '維修問題 Issue      ：'+(o.issue||'-')+'\n'+
     '完成時間 Completed   ：'+doneTime+'\n'+
     '更換零件 Parts Used  ：'+partDisplay+'\n'+
     '────────────────────\n\n'+
@@ -5337,13 +5469,18 @@ function notifyOrderCompleted(o){
       '負責人您好 Dear Owner，\n\n'+
       '以下維修工單已完成，詳情如下:\nThe following service order has been completed:\n'+
       '════════════════════\n'+
-      '工單編號 Order No.  ：'+o.no+'\n'+
-      '公司 Company        ：'+companyName(o.companyId)+'\n'+
-      '設備 Machine        ：'+machineLabel+'\n'+
-      '完成時間 Completed   ：'+doneTime+'\n'+
-      '處理人 Technician    ：'+doneBy+'\n'+
-      '更換零件 Parts Used  ：'+partDisplay+'\n'+
-      '════════════════════\n\n'+
+      '✅ 狀態 Status        ：已完成 Completed\n'+
+      '🆔 工單編號 Order No.  ：'+o.no+'\n'+
+      '📝 手寫單號 Manual Ticket：'+(o.manualNo||'未填 Not provided')+'\n'+
+      '🏢 公司 Company        ：'+companyName(o.companyId)+'\n'+
+      '🧺 設備 Machine        ：'+machineLabel+'\n'+
+      '⚠️ 維修問題 Issue      ：'+(o.issue||'-')+'\n'+
+      '⏰ 完成時間 Completed   ：'+doneTime+'\n'+
+      '👷 處理人 Technician    ：'+doneBy+'\n'+
+      '🔩 更換零件 Parts Used  ：'+partDisplay+'\n'+
+      (o.irreparable?'⛔ 需更換整台設備 Whole-unit replacement needed\n':'')+
+      '════════════════════\n'+
+      (function(){ var b=_openOrdersBlock(o); return b?(b+'════════════════════\n'):''; })()+'\n'+
       '此郵件由系統自動發送。This email was sent automatically.';
     sendEmail(ownerTo, subj, ownerBody, 'order_completed_company', o.no);
     // 記錄本工單已觸發負責人通知 mark this order as owner-notified
@@ -5360,7 +5497,7 @@ function notifyOrderCompleted(o){
 // Technician completed a repair -> notify brand manager (admin backend)
 function notifyRepairDoneToAdmin(o, partText){
   const cn=companyName(o.companyId);
-  pushNotification('repair_done','admin',o.no,'維修完成 Repair completed · '+o.no+'（'+cn+' / '+o.machineId+'）'+(partText?(' · 使用零件 Parts: '+partText):''));
+  pushNotification('repair_done','admin',o.no,'✅ 維修完成 Repair completed · '+o.no+(o.manualNo?(' · 📝 手寫單 '+o.manualNo):'')+'（'+cn+' / '+o.machineId+'）'+(partText?(' · 使用零件 Parts: '+partText):''));
 }
 
 function buildNav(){
@@ -5412,8 +5549,8 @@ function renderDashboard(){
   const _dsw=$('#dashShowWarranty'); if(_dsw) _dsw.checked=_showW;
   const _dsub=$('#dashAlertsSub'); if(_dsub) _dsub.textContent=_showW?'保養過期或維修次數超標的設備。Warranty expired or over repair limit.':'只顯示維修次數超標的設備（保養過期提示已關閉）。Over repair limit only (warranty-expired alerts hidden).';
   const _latest=_dOrders.slice(0,5);
-  $('#dashOrders tbody').innerHTML = _latest.map(o=>`<tr><td>${esc(o.no)}</td><td>${esc(companyName(o.companyId))}</td><td>${esc(o.machineId)}</td><td><span class="chip ${o.status==='completed'?'success':o.status==='new'?'warning':'info'}">${ORDER_STATUS[o.status]||o.status}</span></td></tr>`).join('') || '<tr><td colspan="4" class="small">暫無工單</td></tr>';
-  const dOC=$('#dashOrdersCards'); if(dOC) dOC.innerHTML=_latest.map(o=>`<div class="mcard"><div class="mcard-head"><strong>${esc(o.no)}</strong><span class="chip ${o.status==='completed'?'success':o.status==='new'?'warning':'info'}">${ORDER_STATUS[o.status]||o.status}</span></div><div class="mrow"><span>公司 Company</span><b>${esc(companyName(o.companyId))}</b></div><div class="mrow"><span>機器 Machine</span><b>${esc(o.machineId)}</b></div></div>`).join('') || '<div class="small">暫無工單 No orders</div>';
+  $('#dashOrders tbody').innerHTML = _latest.map(o=>`<tr><td>${esc(o.no)}</td><td>${esc(companyName(o.companyId))}</td><td>${esc(o.machineId)}</td><td><span class="chip ${o.status==='completed'?'success':o.status==='new'?'warning':'info'}">${statusDisp(o.status)}</span></td></tr>`).join('') || '<tr><td colspan="4" class="small">暫無工單</td></tr>';
+  const dOC=$('#dashOrdersCards'); if(dOC) dOC.innerHTML=_latest.map(o=>`<div class="mcard"><div class="mcard-head"><strong>${esc(o.no)}</strong><span class="chip ${o.status==='completed'?'success':o.status==='new'?'warning':'info'}">${statusDisp(o.status)}</span></div><div class="mrow"><span>公司 Company</span><b>${esc(companyName(o.companyId))}</b></div><div class="mrow"><span>機器 Machine</span><b>${esc(o.machineId)}</b></div></div>`).join('') || '<div class="small">暫無工單 No orders</div>';
   const _alertMachines=_vMachines.filter(_isAlert);
   const alertRows = _alertMachines.map(m=>`<tr><td>${esc(m.id)}</td><td>${esc(companyName(m.companyId))}</td><td>${overLimit(m)?'<span class="chip error">維修超標 Over limit</span>':''} ${_wChip(m)}</td></tr>`).join('');
   $('#dashAlerts tbody').innerHTML = alertRows || '<tr><td colspan="3" class="small">暫無提示</td></tr>';
@@ -5622,8 +5759,8 @@ function orderMachineDisp(o){
   if(orderKind(o)==='external'){ return (o.extPhone||o.value||'—'); }
   return o.machineId||'—';
 }
-function _orderRowHtml(o){ return `<tr class="clickable" data-order="${o.no}"><td>${esc(o.no)}</td><td>${o.manualNo?`<span class="chip muted">${esc(o.manualNo)}</span>`:`<span class="small" style="opacity:.5">—</span>`}</td><td>${orderKindChip(o)}</td><td>${esc(o.created||'—')}</td><td>${esc(orderCompanyDisp(o))}</td><td>${esc(orderMachineDisp(o))}</td><td>${esc(o.issue)}${o.irreparable?' <span class="chip error">整台更換 Replace Unit</span>':''}</td><td>${o.urgency==='urgent'?'<span class="chip error">緊急 Urgent</span>':'<span class="chip muted">非緊急 Non-Urgent</span>'}</td><td>${esc(o.bookingDate)} ${esc(o.slot)}</td><td><span class="chip ${o.status==='completed'?'success':o.status==='new'?'warning':'info'}">${ORDER_STATUS[o.status]||o.status}</span></td><td onclick="event.stopPropagation()">${orderActions(o)}</td></tr>`; }
-function _orderCardHtml(o){ return `<div class="mcard" data-order="${o.no}"><div class="mcard-head"><strong>${esc(o.no)}</strong><span class="chip ${o.status==='completed'?'success':o.status==='new'?'warning':'info'}">${ORDER_STATUS[o.status]||o.status}</span></div><div class="mrow"><span>類型 Type</span><b>${orderKindChip(o)}</b></div><div class="mrow"><span>下單時間 Order Time</span><b>${esc(o.created||'—')}</b></div><div class="mrow"><span>公司/客戶 Company</span><b>${esc(orderCompanyDisp(o))}</b></div><div class="mrow"><span>機器/內容 Machine</span><b>${esc(orderMachineDisp(o))}</b></div>${o.manualNo?`<div class="mrow"><span>手寫單號 Manual</span><b>${esc(o.manualNo)}</b></div>`:''}<div class="mrow"><span>問題 Issue</span><b>${esc(o.issue)}${o.irreparable?' <span class="chip error">整台更換 Replace Unit</span>':''}</b></div><div class="mrow"><span>預約 Booking</span><b>${esc(o.bookingDate)} ${esc(o.slot)}</b></div><div class="mcard-actions" onclick="event.stopPropagation()">${orderActions(o)}</div></div>`; }
+function _orderRowHtml(o){ return `<tr class="clickable" data-order="${o.no}"><td>${esc(o.no)}</td><td>${o.manualNo?`<span class="chip muted">📝 ${esc(o.manualNo)}</span>`:`<span class="small" style="opacity:.5">—</span>`}</td><td>${orderKindChip(o)}</td><td>${esc(o.created||'—')}</td><td>${esc(orderCompanyDisp(o))}</td><td>${esc(orderMachineDisp(o))}</td><td>${esc(o.issue)}${o.irreparable?' <span class="chip error">整台更換 Replace Unit</span>':''}</td><td>${o.urgency==='urgent'?'<span class="chip error">緊急 Urgent</span>':'<span class="chip muted">非緊急 Non-Urgent</span>'}</td><td>${esc(o.bookingDate)} ${esc(o.slot)}</td><td><span class="chip ${o.status==='completed'?'success':o.status==='new'?'warning':'info'}">${statusDisp(o.status)}</span></td><td onclick="event.stopPropagation()">${orderActions(o)}</td></tr>`; }
+function _orderCardHtml(o){ return `<div class="mcard" data-order="${o.no}"><div class="mcard-head"><strong>${esc(o.no)}</strong><span class="chip ${o.status==='completed'?'success':o.status==='new'?'warning':'info'}">${statusDisp(o.status)}</span></div><div class="mrow"><span>類型 Type</span><b>${orderKindChip(o)}</b></div><div class="mrow"><span>下單時間 Order Time</span><b>${esc(o.created||'—')}</b></div><div class="mrow"><span>公司/客戶 Company</span><b>${esc(orderCompanyDisp(o))}</b></div><div class="mrow"><span>機器/內容 Machine</span><b>${esc(orderMachineDisp(o))}</b></div>${o.manualNo?`<div class="mrow"><span>手寫單號 Manual</span><b>${esc(o.manualNo)}</b></div>`:''}<div class="mrow"><span>問題 Issue</span><b>${esc(o.issue)}${o.irreparable?' <span class="chip error">整台更換 Replace Unit</span>':''}</b></div><div class="mrow"><span>預約 Booking</span><b>${esc(o.bookingDate)} ${esc(o.slot)}</b></div><div class="mcard-actions" onclick="event.stopPropagation()">${orderActions(o)}</div></div>`; }
 function renderOrders(){
   const rows = orderRowsFiltered();
   const active=_sortOrdersActive(rows.filter(o=>o.status!=='completed'));
@@ -5712,11 +5849,13 @@ function openOrderEdit(no){
     const oldC={...o, companyId:companyName(o.companyId)}, newC={...nv, companyId:companyName(nv.companyId)};
     const changes=diffFields(oldC,newC,map);
     const wasCompleted=o.status==='completed';
+    const _before=_snapOrder(o);
     Object.assign(o,nv);
-    touchOrder(o); // 打時間戳:管理端修改為最新 stamp admin edit as freshest for cloud merge
+    touchOrder(o);
     if(recordEdit(o,'edit_order',o.no,changes)) toast('工單已修改 Order updated'); else toast('未有變動 No changes');
     if(!wasCompleted && o.status==='completed') notifyOrderCompletedIfNeeded(o);
     closeModal(); refreshAll();
+    commitOrderEditUI(o, _before); // 寫入數據庫最新版本並核對 write onto the current DB record and verify
   });
 }
 function deleteOrder(no){
@@ -7076,6 +7215,7 @@ function openOrderModal(no){
     syncPartsUI();
 
     $('#m_saveOrder').addEventListener('click',()=>{
+      const _before=_snapOrder(o);
       const wasCompleted=o.status==='completed';
       const old=ORDER_STATUS[o.status]||o.status;
       o.status=$('#m_status').value;
@@ -7099,8 +7239,9 @@ function openOrderModal(no){
         if(Array.isArray(o.partsUsed) && o.partsUsed.length){ setOrderParts(o, [], '後台改回未完成 admin revert'); }
         reopenOrderClearCompletion(o); // 由已完成改回非完成:清除完成標記,避免同步後被 _healOrders 打回 clear completion markers
       }
-      touchOrder(o); // 打時間戳:詳情快捷改狀態為最新 stamp quick status change as freshest
+      touchOrder(o);
       refreshAll(); closeModal(); toast('工單已更新 Order updated');
+      commitOrderEditUI(o, _before);
     });
   }
 }
@@ -8273,25 +8414,28 @@ function buildOrderText(order){
     status:(ORDER_STATUS[order.status]||order.status||'-'),
     address:_addr,
     nav:(_addr&&_addr!=='-'?navUrl(_addr):''),
-    door:_door
+    door:_door,
+    manual:(order.manualNo||'')
   };
   var def='🔔 【'+_bnSys(bn)+'】新工單 New Service Order · '+vals.no+'\n\n'+
     '👉 師父維修工單站 Repair Station（點入直接更改工單 tap to open & update）：\n'+vals.link+'\n\n'+
     '負責人您好 Dear Owner，\n\n'+
     '收到一張新的工單，詳情如下：\nA new service order has been created:\n'+
     '════════════════════\n'+
-    '工單編號 Order No.  ：'+vals.no+'\n'+
-    '類型 Type           ：'+vals.kind+'\n'+
-    '公司/客戶 Company   ：'+vals.company+'\n'+
-    '內容 Machine/Item   ：'+vals.machine+'\n'+
+    '🆕 狀態 Status       ：新建立 New\n'+
+    '🆔 工單編號 Order No.  ：'+vals.no+'\n'+
+    (order.manualNo?('📝 手寫單號 Manual Ticket：'+order.manualNo+'\n'):'')+
+    '📋 類型 Type           ：'+vals.kind+'\n'+
+    '🏢 公司/客戶 Company   ：'+vals.company+'\n'+
+    '🧺 內容 Machine/Item   ：'+vals.machine+'\n'+
     (order.installIT?(_itNotifyBlock(order.installIT)):'')+
-    '問題 Issue          ：'+vals.issue+'\n'+
-    '緊急 Urgency        ：'+vals.urgency+'\n'+
-    '預約 Booking        ：'+vals.booking+'\n'+
-    '聯絡 Contact        ：'+vals.contact+'\n'+
-    '服務地址 Address    ：'+vals.address+
+    '⚠️ 問題 Issue          ：'+vals.issue+'\n'+
+    '🚦 緊急 Urgency        ：'+vals.urgency+'\n'+
+    '📅 預約 Booking        ：'+vals.booking+'\n'+
+    '📞 聯絡 Contact        ：'+vals.contact+'\n'+
+    '🏠 服務地址 Address    ：'+vals.address+
     (vals.door?('\n🔑 門鎖密碼 Door Code ：'+vals.door):'')+
-    (vals.notes?('\n備註 Notes          ：'+vals.notes):'')+'\n'+
+    (vals.notes?('\n🗒️ 備註 Notes          ：'+vals.notes):'')+'\n'+
     '════════════════════'+
     (vals.nav?('\n\n📍 一鍵導航 Google 地圖 Open in Google Maps：\n'+vals.nav):'');
   var tpl=(config.n8nTextTpl||'').trim();
@@ -8305,7 +8449,7 @@ function buildOrderText(order){
     .replace(/\{booking\}/g,vals.booking).replace(/\{contact\}/g,vals.contact)
     .replace(/\{notes\}/g,vals.notes).replace(/\{status\}/g,vals.status)
     .replace(/\{address\}/g,vals.address).replace(/\{nav\}/g,vals.nav)
-    .replace(/\{link\}/g,vals.link);
+    .replace(/\{link\}/g,vals.link).replace(/\{manual\}/g,vals.manual);
 }
 function sendToN8n(order){
   if(!config.n8nEnabled || !config.n8nUrl) return;
@@ -8333,6 +8477,24 @@ function sendCompletionToN8n(order){
     .catch(()=>{ toast('n8n 完成通知發送失敗 Completion send failed'); });
 }
 // 完成工單 Telegram 內文(中英雙語)。Completion Telegram text (bilingual).
+// 同一公司嘅其他未完成工單(只限同一品牌/公司)other unfinished orders of the SAME company only
+function _openOrdersBlock(o){
+  if(!o || o.kind==='external' || !o.companyId) return '';
+  var list=(store.orders||[]).filter(function(x){ return x && x.no!==o.no && x.companyId===o.companyId && x.kind!=='external' && x.status!=='completed' && x.status!=='cancelled'; });
+  var c=store.companies.find(function(x){return x.id===o.companyId;});
+  var cn=c?((c.name_zh||'')+(c.name_en?(' '+c.name_en):'')):'';
+  var head='📌 '+cn+' 未完成工單 Unfinished Orders（'+list.length+'）：\n';
+  if(!list.length) return head+'🎉 暫無其他未完成工單 No other unfinished orders\n';
+  list.sort(function(a,b){ return String(a.created||'').localeCompare(String(b.created||'')); });
+  var lines=list.slice(0,30).map(function(x){
+    var mm=store.machines.find(function(y){return y.id===x.machineId;});
+    var ml=x.itAssetId?_itAssetDisp(x):((x.machineId||'')+(mm&&mm.name?(' '+mm.name):''));
+    var iss=String(x.issue||'').replace(/\s+/g,' ').trim(); if(iss.length>30) iss=iss.slice(0,30)+'…';
+    return '• '+x.no+(x.manualNo?(' 📝'+x.manualNo):'')+' · '+statusDisp(x.status)+(ml?(' · '+ml):'')+(iss?(' · '+iss):'');
+  });
+  if(list.length>30) lines.push('…另有 '+(list.length-30)+' 張 and '+(list.length-30)+' more');
+  return head+lines.join('\n')+'\n';
+}
 function buildCompletionText(o){
   var c=store.companies.find(function(x){return x.id===o.companyId;});
   var m=store.machines.find(function(x){return x.id===o.machineId;});
@@ -8343,17 +8505,22 @@ function buildCompletionText(o){
   var partText=(typeof orderPartsText==='function')?orderPartsText(o):'';
   var partDisplay=partText?partText:(o.irreparable?'需更換整台設備 Whole-unit replacement':'無 None');
   var coDisp=(o.kind==='external')?((o.extName||o.contact||'散客 Walk-in')):((c?((c.name_zh||'')+(c.name_en?(' '+c.name_en):'')):'-'));
-  return '✅ 【'+bn+'】維修完成 Repair Completed · '+(o.no||'')+'\n\n'+
+  return '✅ 【'+_bnSys(bn)+'】維修完成 Repair Completed · '+(o.no||'')+'\n\n'+
     '負責人您好 Dear Owner，\n\n'+
     '以下工單已完成 The following order is completed：\n'+
     '════════════════════\n'+
-    '工單編號 Order No.  ：'+(o.no||'')+'\n'+
-    '公司/客戶 Company   ：'+coDisp+'\n'+
-    '設備 Machine        ：'+machineLabel+'\n'+
-    '完成時間 Completed   ：'+doneTime+'\n'+
-    '處理人 Technician    ：'+doneBy+'\n'+
-    '更換零件 Parts Used  ：'+partDisplay+'\n'+
-    '════════════════════\n\n'+
+    '✅ 狀態 Status         ：已完成 Completed\n'+
+    '🆔 工單編號 Order No.  ：'+(o.no||'')+'\n'+
+    '📝 手寫單號 Manual Ticket：'+(o.manualNo||'未填 Not provided')+'\n'+
+    '🏢 公司/客戶 Company   ：'+coDisp+'\n'+
+    '🧺 設備 Machine        ：'+machineLabel+'\n'+
+    '⚠️ 維修問題 Issue      ：'+(o.issue||'-')+'\n'+
+    '⏰ 完成時間 Completed   ：'+doneTime+'\n'+
+    '👷 處理人 Technician    ：'+doneBy+'\n'+
+    '🔩 更換零件 Parts Used  ：'+partDisplay+'\n'+
+    (o.irreparable?'⛔ 需更換整台設備 Whole-unit replacement needed\n':'')+
+    '════════════════════\n'+
+    (function(){ var b=_openOrdersBlock(o); return b?(b+'════════════════════\n'):''; })()+'\n'+
     '此通知由系統自動發送。This notification was sent automatically.';
 }
 
@@ -8781,12 +8948,13 @@ function techOrderActions(o){
 // Technician claims / starts an order: new -> in_progress, records who
 function techStartOrder(orderNo){
   const o=store.orders.find(x=>x.no===orderNo); if(!o) return;
+  const _before=_snapOrder(o);
   o.status='in_progress';
   o.assignedTech=curUser();
   if(!o.startedAt) o.startedAt=nowStr();
   try{ addLog('tech_start', o.no, '師父開始維修 '+curUser()); }catch(e){}
-  touchOrder(o); // 打時間戳:開始維修為最新 stamp start as freshest
-  refreshAll();
+  touchOrder(o);
+  refreshAll(); commitOrderEditUI(o, _before);
   toast('已開始維修 '+o.no+' · Started');
 }
 
@@ -8856,6 +9024,7 @@ function openTechComplete(orderNo){
     // 整理清單:去掉未選零件的列。Build clean list; drop rows with no part chosen.
     const clean=_tcRows.filter(r=>r.partId).map(r=>({partId:r.partId, qty:Math.max(1,Number(r.qty)||1)}));
     const irreparable=$('#tc_irreparable').checked;
+    const _before=_snapOrder(o);
     // 一對一對帳扣庫存(重複提交唔會重複扣;移除嘅零件會退回)。Idempotent reconcile.
     setOrderParts(o, clean, '師父完成 tech complete');
     const partText=orderPartsText(o);
@@ -8874,9 +9043,10 @@ function openTechComplete(orderNo){
       notifyRepairDoneToAdmin(o, partText + (irreparable?'（整台更換 whole-unit）':''));
       notifyOrderCompletedIfNeeded(o); // 已登入略過;免登入才發 skip when logged in
     }
-    touchOrder(o); // 打時間戳:後台完成彈窗為最新 stamp modal completion as freshest
+    touchOrder(o);
     refreshAll();
     closeModal();
+    commitOrderEditUI(o, _before);
     toast('已完成並通知品牌管理人 Completed & notified admin');
   });
 }
